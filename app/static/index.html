@@ -3,10 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TrazoCad v65 | Fidelidad mejorada</title>
+    <title>TrazoCad v66 | OCR dirigido</title>
     <meta
       name="description"
-      content="TrazoCad by TLK digitaliza croquis y planos escaneados para generar DXF, PDF, JPG y PNG con una interfaz profesional y simple."
+      content="TrazoCad by TLK digitaliza croquis y planos escaneados para generar DXF, PDF, JPG y PNG con OCR dirigido y una interfaz profesional simple."
     />
     <link rel="icon" type="image/png" href="/static/assets/favicon.png" />
     <link rel="stylesheet" href="/static/styles.css" />
@@ -18,13 +18,13 @@
           <img src="/static/assets/tlk-logo.png" alt="Tecno Logisti-K SA" class="brand-logo" />
           <div>
             <p class="eyebrow">TrazoCad by TLK</p>
-            <h1>TrazoCad v65</h1>
-            <p class="hero-subtitle">Digitalización técnica de planos a DXF y PDF con salida profesional simple.</p>
+            <h1>TrazoCad v66</h1>
+            <p class="hero-subtitle">Digitalización técnica con OCR dirigido, mejor reconstrucción raster y salida profesional simple.</p>
           </div>
         </div>
         <div class="hero-links">
           <a href="/manual" target="_blank" rel="noopener noreferrer">Manual de uso</a>
-          <span id="versionBadge">Versión 65.0.0</span>
+          <span id="versionBadge">Versión 66.0.0</span>
         </div>
       </header>
 
@@ -32,12 +32,14 @@
         <div class="section-head">
           <div>
             <h2>Procesar archivo</h2>
-            <p>Subí una imagen, elegí el criterio básico y generá salidas técnicas limpias.</p>
+            <p>Subí una imagen, elegí el criterio básico y generá salidas técnicas más fieles.</p>
           </div>
           <span class="section-tag">Flujo principal</span>
         </div>
 
         <form id="uploadForm" novalidate>
+          <input type="hidden" name="notes" id="notesInput" value="" />
+
           <label class="field field-file">
             <span>Archivo</span>
             <input id="fileInput" type="file" name="file" accept=".png,.jpg,.jpeg,.bmp,.tif,.tiff" required />
@@ -76,9 +78,30 @@
             </label>
           </div>
 
+          <div class="grid-2">
+            <label class="field">
+              <span>Temática de ayuda</span>
+              <select id="noteTheme">
+                <option value="">Sin guía adicional</option>
+                <option value="fidelidad">Fidelidad del plano</option>
+                <option value="rotulo">Rótulo y notas</option>
+                <option value="cotas">Cotas y textos</option>
+                <option value="geometria">Geometría y perímetros</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Acción sugerida</span>
+              <select id="noteAction">
+                <option value="">Sin acción extra</option>
+              </select>
+            </label>
+          </div>
+
           <label class="field">
-            <span>Notas opcionales</span>
-            <textarea name="notes" rows="4" placeholder="Ej: respetar orientación original, priorizar perímetro exterior, conservar ejes principales"></textarea>
+            <span>Instrucción adicional libre</span>
+            <textarea id="notesFree" rows="3" placeholder="Ej: conservar rótulo completo, reforzar líneas punteadas, priorizar cotas y ejes principales"></textarea>
+            <small>Esta ayuda sí se incorpora al proceso. Usala para priorizar fidelidad, rótulo, cotas o geometría. Las listas te guían con casos concretos y el texto libre agrega un pedido puntual.</small>
           </label>
 
           <div class="form-actions">

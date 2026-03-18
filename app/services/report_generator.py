@@ -66,16 +66,16 @@ def build_report_pdf(output_path: Path, result: dict[str, Any], drawing_type: st
     page_width, page_height = _resolve_sheet_size(sheet_size, orientation)
     page = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
 
-    frame_margin = 10 * mm
-    footer_height = 16 * mm
+    frame_margin = 5 * mm
+    footer_height = 9 * mm
     drawable_left = frame_margin
     drawable_bottom = frame_margin + footer_height
     drawable_width = page_width - 2 * frame_margin
     drawable_height = page_height - (2 * frame_margin + footer_height)
 
-    line_color = Color(0.82, 0.86, 0.9)
+    line_color = Color(0.84, 0.87, 0.90)
     page.setStrokeColor(line_color)
-    page.setLineWidth(0.6)
+    page.setLineWidth(0.5)
     page.rect(frame_margin, frame_margin, page_width - 2 * frame_margin, page_height - 2 * frame_margin)
     page.line(frame_margin, frame_margin + footer_height, page_width - frame_margin, frame_margin + footer_height)
 
@@ -93,16 +93,16 @@ def build_report_pdf(output_path: Path, result: dict[str, Any], drawing_type: st
             page.drawImage(str(cropped), render_x, render_y, width=render_w, height=render_h, preserveAspectRatio=True, mask='auto')
 
     page.setFillColor(Color(0.22, 0.27, 0.33))
-    page.setFont('Helvetica-Bold', 9)
-    page.drawString(frame_margin + 4 * mm, frame_margin + 9.5 * mm, 'TrazoCad | Tecno Logisti-K SA')
+    page.setFont('Helvetica-Bold', 7.5)
+    page.drawString(frame_margin + 2.5 * mm, frame_margin + 5.6 * mm, 'TrazoCad | Tecno Logisti-K SA')
 
-    page.setFont('Helvetica', 7.5)
-    file_label = (original_filename or 'archivo_sin_nombre')[:58]
-    page.drawString(frame_margin + 4 * mm, frame_margin + 4.5 * mm, f'Archivo: {file_label}')
+    page.setFont('Helvetica', 6.2)
+    file_label = (original_filename or 'archivo_sin_nombre')[:64]
+    page.drawString(frame_margin + 2.5 * mm, frame_margin + 2.0 * mm, f'Archivo: {file_label}')
 
-    right_x = page_width - frame_margin - 4 * mm
-    page.drawRightString(right_x, frame_margin + 9.5 * mm, f'Hoja: {sheet_size.upper()}')
-    page.drawRightString(right_x, frame_margin + 4.5 * mm, f'Tipo: {drawing_type} | Fecha: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
+    right_x = page_width - frame_margin - 2.5 * mm
+    page.drawRightString(right_x, frame_margin + 5.6 * mm, f'Hoja: {sheet_size.upper()}')
+    page.drawRightString(right_x, frame_margin + 2.0 * mm, f'Tipo: {drawing_type} | Fecha: {datetime.now().strftime("%Y-%m-%d %H:%M")}')
 
     page.showPage()
     page.save()

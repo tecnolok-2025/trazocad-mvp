@@ -27,7 +27,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '65.0.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '66.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,7 +49,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release de fidelidad mejorada: presentación más fiel del plano, DXF/PDF/JPG/PNG y fallback raster para textos y rótulos.',
+    description='TrazoCad release de OCR dirigido y reconstrucción documental: presentación más fiel del plano, OCR por regiones, DXF/PDF/JPG/PNG y reconstrucción base más inteligente.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -64,7 +64,7 @@ STAGE_MAP = {
     'preparando_archivo': {'percent': 8, 'detail': 'Validando el archivo y preparando el área de trabajo.'},
     'reconstruyendo_base': {'percent': 24, 'detail': 'Corrigiendo base, perspectiva y contraste sin deformar el plano.'},
     'separando_texto_y_dibujo': {'percent': 42, 'detail': 'Separando zonas de dibujo para dejar una base geométrica más limpia.'},
-    'reconociendo_texto': {'percent': 58, 'detail': 'Consolidando capas internas de análisis sin exponer OCR en la interfaz.'},
+    'reconociendo_texto': {'percent': 58, 'detail': 'Reconociendo textos, cotas y rótulos por regiones priorizadas del plano.'},
     'vectorizando_geometria': {'percent': 72, 'detail': 'Detectando líneas, contornos y trazos útiles para las salidas técnicas.'},
     'generando_salida': {'percent': 90, 'detail': 'Generando DXF, PDF y variantes raster finales.'},
     'finalizando': {'percent': 97, 'detail': 'Ordenando resultados y preparando acciones de descarga.'},
@@ -78,7 +78,7 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'release profesional final',
+        'linea': 'ocr dirigido y reconstrucción documental',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),
@@ -124,7 +124,7 @@ def _missing_outputs(job_id: str) -> list[str]:
 
 def _preferred_clean_image(result: dict) -> Path:
     output_files = result.get('output_files', {}) if isinstance(result, dict) else {}
-    for key in ('cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
+    for key in ('presentation_image', 'cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
         raw = output_files.get(key)
         if raw and Path(raw).exists():
             return Path(raw)
@@ -142,6 +142,7 @@ def _result_summary(result: dict, drawing_type: str, sheet_size: str) -> dict[st
         'orientacion_documento': str(result.get('document_orientation', 'sin-dato')),
         'lineas': int(result.get('detected_line_count', 0)),
         'contornos': int(result.get('detected_contour_count', 0)),
+        'textos_ocr': int(result.get('recognized_text_count', 0)),
         'escala_mm_px': float(result.get('estimated_scale_mm_per_px', 0)),
         'precision_clase': str(result.get('precision_class', 'preliminar')),
     }
@@ -395,7 +396,7 @@ def infra() -> JSONResponse:
                 'nota': 'La release privilegia estabilidad y puede usar SQLite local como fallback si PostgreSQL/Neon no responde.',
             },
             'persistencia': persistence.stats(),
-            'alcance': 'Release de fidelidad mejorada: presentación más fiel del plano, mejor preservación de rótulos/textos en PDF/JPG/PNG y DXF nube de puntos con base raster.',
+            'alcance': 'Release de OCR dirigido y reconstrucción documental: presentación más fiel del plano, OCR por regiones, mejor preservación de rótulos/textos y DXF nube de puntos con base raster fiel.',
         }
     )
 

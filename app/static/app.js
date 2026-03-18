@@ -18,6 +18,57 @@ const dxfActions = document.getElementById('dxfActions');
 const pdfActions = document.getElementById('pdfActions');
 const imageActions = document.getElementById('imageActions');
 
+const notesInput = document.getElementById('notesInput');
+const noteTheme = document.getElementById('noteTheme');
+const noteAction = document.getElementById('noteAction');
+const notesFree = document.getElementById('notesFree');
+
+const NOTE_PRESETS = {
+  fidelidad: [
+    { value: 'Preservar el plano completo y evitar limpieza agresiva en áreas débiles.', label: 'Preservar plano completo' },
+    { value: 'Reconstruir trazos finos y punteados sin deformar la geometría principal.', label: 'Reforzar trazos finos y punteados' },
+    { value: 'Priorizar fidelidad visual por encima de simplificación extrema.', label: 'Priorizar fidelidad visual' },
+  ],
+  rotulo: [
+    { value: 'Preservar y reforzar el rótulo inferior derecho y las referencias.', label: 'Preservar rótulo inferior derecho' },
+    { value: 'Intentar OCR dirigido sobre rótulo, referencias y notas.', label: 'OCR dirigido a rótulo y notas' },
+    { value: 'No recortar ni limpiar agresivamente el cuadro de rótulo.', label: 'Evitar limpieza agresiva del rótulo' },
+  ],
+  cotas: [
+    { value: 'Priorizar cotas, ejes y textos numéricos aunque aumente el tiempo de proceso.', label: 'Priorizar cotas y ejes' },
+    { value: 'Intentar OCR dirigido sobre cotas y textos técnicos.', label: 'OCR dirigido a cotas' },
+    { value: 'Conservar líneas de cota y flechas aunque estén débiles.', label: 'Conservar líneas de cota' },
+  ],
+  geometria: [
+    { value: 'Reconstruir perímetros, arcos y contornos incompletos del dibujo.', label: 'Reconstruir perímetros y arcos' },
+    { value: 'Cerrar pequeños cortes de línea sin deformar el plano.', label: 'Cerrar cortes pequeños de línea' },
+    { value: 'Priorizar ejes estructurales, marcos y contornos dominantes.', label: 'Priorizar ejes y contornos dominantes' },
+  ],
+};
+
+function refreshNoteActions() {
+  if (!noteTheme || !noteAction) return;
+  const theme = noteTheme.value;
+  const items = NOTE_PRESETS[theme] || [];
+  noteAction.innerHTML = '<option value="">Sin acción extra</option>';
+  items.forEach((item) => {
+    const option = document.createElement('option');
+    option.value = item.value;
+    option.textContent = item.label;
+    noteAction.appendChild(option);
+  });
+}
+
+function composeNotes() {
+  const parts = [];
+  if (noteTheme?.value) parts.push(`Temática: ${noteTheme.options[noteTheme.selectedIndex].text}`);
+  if (noteAction?.value) parts.push(`Acción sugerida: ${noteAction.value}`);
+  const free = notesFree?.value?.trim();
+  if (free) parts.push(`Instrucción adicional: ${free}`);
+  if (notesInput) notesInput.value = parts.join(' | ');
+}
+
+
 const CURRENT_JOB_STORAGE_KEY = 'trazocad.currentJobId';
 const MAX_UPLOAD_MB = 25;
 const POLL_INTERVAL_MS = 2500;
@@ -139,7 +190,7 @@ function renderSummary(summary) {
     ['Hoja', summary.hoja || '—'],
     ['Orientación', summary.orientacion_documento || '—'],
     ['Líneas', String(summary.lineas ?? '—')],
-    ['Contornos', String(summary.contornos ?? '—')],
+    ['Textos OCR', String(summary.textos_ocr ?? '—')],
     ['Precisión', summary.precision_clase || '—'],
   ];
   chips.forEach(([label, value]) => summaryStrip.appendChild(createSummaryChip(label, value)));
@@ -286,6 +337,7 @@ form.addEventListener('submit', async (event) => {
     return;
   }
 
+  composeNotes();
   const formData = new FormData(form);
   setBusy(true);
   setProgress(2);
@@ -323,3 +375,6 @@ fileInput.addEventListener('change', () => {
 
 fetchVersion();
 restoreJobIfNeeded();
+
+if (noteTheme) noteTheme.addEventListener('change', refreshNoteActions);
+refreshNoteActions();

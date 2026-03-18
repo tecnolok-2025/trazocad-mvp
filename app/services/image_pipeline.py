@@ -210,6 +210,38 @@ def _build_binary(gray: np.ndarray) -> np.ndarray:
     return binary
 
 
+def _repair_broken_traces(binary: np.ndarray) -> np.ndarray:
+    repaired = binary.copy()
+    kernels = [
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
+    ]
+    diag1 = np.eye(5, dtype=np.uint8)
+    diag2 = np.fliplr(diag1)
+    for kernel in kernels + [diag1, diag2]:
+        repaired = cv2.morphologyEx(repaired, cv2.MORPH_CLOSE, kernel, iterations=1)
+    repaired = cv2.bitwise_or(repaired, binary)
+    return repaired
+
+
+def _reinforce_title_block(binary: np.ndarray) -> np.ndarray:
+    h, w = binary.shape[:2]
+    y1, x1 = int(h * 0.68), int(w * 0.66)
+    roi = binary[y1:h, x1:w].copy()
+    if roi.size == 0:
+        return binary
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, roi.shape[1] // 28), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, roi.shape[0] // 18)))
+    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, h_kernel, iterations=1)
+    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, v_kernel, iterations=1)
+    out = binary.copy()
+    out[y1:h, x1:w] = cv2.bitwise_or(out[y1:h, x1:w], roi)
+    return out
+
+
 def _skeletonize(binary: np.ndarray) -> np.ndarray:
     img = binary.copy()
     skel = np.zeros_like(img)
@@ -589,13 +621,44 @@ def _preparar_region_ocr(roi_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(binaria, cv2.COLOR_GRAY2BGR)
 
 
-def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]]) -> tuple[list[dict[str, Any]], str, str | None]:
-    if not text_boxes:
+def _collect_priority_ocr_regions(text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, image_shape: tuple[int, int, int]) -> list[dict[str, int]]:
+    h, w = image_shape[:2]
+    regions = [dict(box) for box in text_boxes]
+    title_blocks = _detect_title_block(graphics_binary)
+    regions.extend(title_blocks)
+    regions.append({'x': int(w * 0.62), 'y': int(h * 0.67), 'w': int(w * 0.34), 'h': int(h * 0.26)})
+    regions.append({'x': int(w * 0.30), 'y': int(h * 0.84), 'w': int(w * 0.32), 'h': int(h * 0.10)})
+    deduped: list[dict[str, int]] = []
+    for item in regions:
+        if item['w'] <= 0 or item['h'] <= 0:
+            continue
+        duplicate = False
+        for keep in deduped:
+            ix1 = max(item['x'], keep['x'])
+            iy1 = max(item['y'], keep['y'])
+            ix2 = min(item['x'] + item['w'], keep['x'] + keep['w'])
+            iy2 = min(item['y'] + item['h'], keep['y'] + keep['h'])
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            area = max(item['w'] * item['h'], 1)
+            if inter / area > 0.70:
+                duplicate = True
+                break
+        if not duplicate:
+            deduped.append(item)
+    deduped.sort(key=lambda b: ((1 if b['y'] > h * 0.70 else 0) + (1 if b['x'] > w * 0.55 else 0), b['w'] * b['h']), reverse=True)
+    return deduped
+
+
+def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_binary: np.ndarray) -> tuple[list[dict[str, Any]], str, str | None]:
+    candidate_regions = _collect_priority_ocr_regions(text_boxes, graphics_binary, image_bgr.shape)
+    if not candidate_regions:
         return [], "sin zonas de texto", None
     try:
         from rapidocr_onnxruntime import RapidOCR  # type: ignore
     except Exception:
-        return [], "no disponible", "No se encontró un motor OCR instalado. Si querés OCR real en Render, instalá rapidocr-onnxruntime."
+        return [], "no disponible", "No se encontró un motor OCR instalado. Para activar OCR real en Render instalá rapidocr-onnxruntime."
 
     try:
         engine = RapidOCR()
@@ -623,7 +686,7 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]]) -> tuple[l
     # la cantidad de cajas según tamaño/área.
     warnings: list[str] = []
     texts: list[dict[str, Any]] = []
-    boxes = sorted(text_boxes, key=lambda b: (b.get("w", 0) * b.get("h", 0)), reverse=True)
+    boxes = list(candidate_regions)
     max_boxes = 60
     if len(boxes) > max_boxes:
         warnings.append(f"OCR reducido: se analizaron {max_boxes} regiones prioritarias de {len(boxes)} detectadas para evitar sobrecarga del servidor.")
@@ -1004,15 +1067,15 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
         cv2.rectangle(clean, (item["x"], item["y"]), (item["x"] + item["w"], item["y"] + item["h"]), (170, 170, 220), 1)
     return clean
 
-def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray) -> np.ndarray:
-    # Prioriza fidelidad visual del plano completo: conserva rótulos, textos y cotas como imagen limpia.
+def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray) -> np.ndarray:
     base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
-    _, soft = cv2.threshold(base_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    soft = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
     soft = cv2.medianBlur(soft, 3)
-    # Recupera trazos finos del binario para que no se pierdan líneas punteadas ni cuadriculados de rótulo.
-    recovered = cv2.bitwise_or(cv2.bitwise_not(soft), binary)
-    presentation = cv2.cvtColor(cv2.bitwise_not(recovered), cv2.COLOR_GRAY2BGR)
-    return presentation
+    recovered = cv2.bitwise_or(cv2.bitwise_not(soft), repaired_binary)
+    recovered = cv2.bitwise_or(recovered, binary)
+    presentation_gray = cv2.bitwise_not(recovered)
+    presentation_gray = cv2.normalize(presentation_gray, None, 0, 255, cv2.NORM_MINMAX)
+    return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
 
 
 def _insights(
@@ -1049,7 +1112,7 @@ def _insights(
     out.append(
         f"El motor OCR activo fue: {ocr_engine}. Se reconocieron {quality_metrics['recognized_text_count']} bloques de texto aprovechables, con {quality_metrics.get('cota_texts', 0)} posibles cotas y {quality_metrics.get('rotulo_texts', 0)} textos de rótulo o cuadro."
         if ocr_engine not in {"no disponible", "sin zonas de texto", "falló"}
-        else "El proceso ya separa zonas candidatas de texto del dibujo, aunque todavía conviene activar un motor OCR dedicado para que el DXF incorpore textos reales y no manchas."
+        else "El proceso separa zonas candidatas de texto del dibujo, pero en esta ejecución no pudo consolidar OCR suficiente para convertir más textos del plano en entidades útiles."
     )
     if quality_metrics.get("title_blocks", 0) > 0:
         out.append(f"Se detectó {quality_metrics.get('title_blocks', 0)} cuadro de plano o rótulo principal en la zona inferior derecha para ayudar al orden del DXF y la lectura del documento.")
@@ -1220,18 +1283,18 @@ def process_drawing(
     image, auto_upscaled, upscale_factor = _auto_upscale(image)
     reconstructed_gray, normalized_gray, enhanced_bgr = _enhance_image(image)
     binary = _build_binary(reconstructed_gray)
+    repaired_binary = _repair_broken_traces(binary)
+    repaired_binary = _reinforce_title_block(repaired_binary)
     if progress_callback:
         progress_callback("separando_texto_y_dibujo")
-    text_boxes, text_mask = _detect_text_regions(binary)
-    graphics_binary = cv2.bitwise_and(binary, cv2.bitwise_not(text_mask))
+    text_boxes, text_mask = _detect_text_regions(repaired_binary)
+    graphics_binary = cv2.bitwise_and(repaired_binary, cv2.bitwise_not(text_mask))
     graphics_binary = cv2.morphologyEx(graphics_binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
 
     if progress_callback:
         progress_callback("reconociendo_texto")
-    ocr_items = []
-    ocr_engine = "desactivado"
-    ocr_warning = "OCR todavía no está incorporado como salida productiva. En esta versión se prioriza preservar visualmente rótulos, notas y cotas en PDF/JPG/PNG y en el DXF nube de puntos."
-    cota_texts, rotulo_texts, general_texts = [], [], []
+    ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary)
+    cota_texts, rotulo_texts, general_texts = _classify_text_items(ocr_items, image.shape)
     if progress_callback:
         progress_callback("vectorizando_geometria")
     geometry = _detect_geometry(graphics_binary, text_boxes)
@@ -1322,7 +1385,7 @@ def process_drawing(
     reconstruction_preview = enhanced_bgr.copy()
     analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
     vector_base = _build_vector_base(graphics_binary, ocr_items)
-    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary)
+    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary, repaired_binary)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"

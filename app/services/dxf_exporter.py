@@ -5,7 +5,20 @@ from pathlib import Path
 from typing import Any
 
 import ezdxf
+from ezdxf.enums import TextEntityAlignment
 from PIL import Image
+
+
+def _add_text_item(msp, item: dict[str, Any], layer: str, height_mm: float, mm_per_px: float) -> None:
+    text = str(item.get('text', '')).strip()
+    if not text:
+        return
+    x_mm = float(item.get('x', 0)) * mm_per_px
+    y_mm = height_mm - float(item.get('y', 0)) * mm_per_px
+    box_h_mm = max(float(item.get('h', 0)) * mm_per_px, 1.0)
+    text_height = max(min(box_h_mm * 0.72, 6.0), 1.8)
+    entity = msp.add_text(text, dxfattribs={'layer': layer, 'height': text_height})
+    entity.set_placement((x_mm, y_mm), align=TextEntityAlignment.LEFT)
 
 
 def export_to_dxf(
@@ -20,8 +33,9 @@ def export_to_dxf(
     doc.units = ezdxf.units.MM
     msp = doc.modelspace()
 
-    if 'GEOMETRIA' not in doc.layers:
-        doc.layers.add('GEOMETRIA', color=7)
+    for layer, color in [('GEOMETRIA', 7), ('COTAS', 3), ('TEXTOS', 2), ('ROTULO', 5)]:
+        if layer not in doc.layers:
+            doc.layers.add(layer, color=color)
 
     height_mm = image_height * mm_per_px
 
@@ -38,6 +52,13 @@ def export_to_dxf(
         pts = [(pt['x'] * mm_per_px, height_mm - pt['y'] * mm_per_px) for pt in poly]
         closed = len(poly) >= 3 and (poly[0]['x'], poly[0]['y']) == (poly[-1]['x'], poly[-1]['y'])
         msp.add_lwpolyline(pts, dxfattribs={'layer': 'GEOMETRIA', 'closed': closed})
+
+    for item in geometry.get('cota_texts', []):
+        _add_text_item(msp, item, 'COTAS', height_mm, mm_per_px)
+    for item in geometry.get('general_texts', []):
+        _add_text_item(msp, item, 'TEXTOS', height_mm, mm_per_px)
+    for item in geometry.get('rotulo_texts', []):
+        _add_text_item(msp, item, 'ROTULO', height_mm, mm_per_px)
 
     doc.saveas(output_path)
     return output_path

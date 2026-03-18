@@ -210,3 +210,7 @@ button:disabled { opacity: 0.6; cursor: wait; }
   .hero-links { align-items: flex-start; }
   .grid-3, .results-grid { grid-template-columns: 1fr; }
 }
+
+.grid-2 { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 1rem; }
+@media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+.field small { display:block; margin-top:0.45rem; line-height:1.35; }
