@@ -190,14 +190,11 @@ def _normalize_background(gray: np.ndarray) -> np.ndarray:
 def _enhance_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     normalized = _normalize_background(gray)
-    clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.7, tileGridSize=(8, 8))
     contrast = clahe.apply(normalized)
-    if max(gray.shape[:2]) >= 1800:
-        denoised = cv2.medianBlur(contrast, 3)
-    else:
-        denoised = cv2.bilateralFilter(contrast, 5, 30, 30)
-    gaussian = cv2.GaussianBlur(denoised, (0, 0), 0.9)
-    sharpened = cv2.addWeighted(denoised, 1.35, gaussian, -0.35, 0)
+    denoised = cv2.fastNlMeansDenoising(contrast, None, 10, 7, 21)
+    gaussian = cv2.GaussianBlur(denoised, (0, 0), 1.2)
+    sharpened = cv2.addWeighted(denoised, 1.55, gaussian, -0.55, 0)
     whitened = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     return sharpened, normalized, whitened
 
@@ -1319,18 +1316,12 @@ def process_drawing(
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"
     cleaned_path = output_dir / "limpio.png"
-    cleaned_full_path = output_dir / "limpio_full.png"
     overlay_path = output_dir / "overlay.png"
     original_path = output_dir / "original_preview.png"
-    graphics_mask_path = output_dir / "mascara_grafica.png"
-    skeleton_path = output_dir / "esqueleto.png"
     _save_image(reconstruction_path, _resize_for_report(reconstruction_preview))
     _save_image(cleaned_path, _resize_for_report(vector_base))
-    _save_image(cleaned_full_path, vector_base)
     _save_image(overlay_path, _resize_for_report(overlay))
     _save_image(original_path, _resize_for_report(analysis_preview))
-    _save_image(graphics_mask_path, cv2.cvtColor(cv2.bitwise_not(graphics_binary), cv2.COLOR_GRAY2BGR))
-    _save_image(skeleton_path, cv2.cvtColor(cv2.bitwise_not(_skeletonize(graphics_binary)), cv2.COLOR_GRAY2BGR))
 
     assumptions = [
         f"Tipo de plano interpretado: {drawing_type}.",
@@ -1404,11 +1395,8 @@ def process_drawing(
         output_files={
             "reconstruction_preview": str(reconstruction_path),
             "cleaned_image": str(cleaned_path),
-            "cleaned_full_image": str(cleaned_full_path),
             "overlay_image": str(overlay_path),
             "original_preview": str(original_path),
-            "graphics_mask": str(graphics_mask_path),
-            "skeleton_image": str(skeleton_path),
         },
         sheet_orientation=sheet_orientation.upper(),
         preserved_aspect_ratio=True,

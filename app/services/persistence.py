@@ -29,13 +29,33 @@ class Persistence:
         self._sqlite_path = SQLITE_PATH
         self._init_provider()
 
+    def _normalize_database_url(self, url: str) -> str:
+        url = url.strip()
+        if not url.startswith(("postgres://", "postgresql://")):
+            return url
+        if "sslmode=" not in url:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}sslmode=require"
+        return url
+
+    def _fallback_to_sqlite(self, reason: str) -> None:
+        self.provider = "sqlite"
+        self.enabled = True
+        self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}. Motivo: {reason}"
+        self._init_sqlite()
+
     def _init_provider(self) -> None:
         if self.database_url and self.database_url.startswith(("postgres://", "postgresql://")) and psycopg is not None:
-            self.provider = "postgres"
-            self.enabled = True
-            self.detail = "Persistencia en PostgreSQL/Neon habilitada."
-            self._init_postgres()
-            return
+            self.database_url = self._normalize_database_url(self.database_url)
+            try:
+                self.provider = "postgres"
+                self.enabled = True
+                self.detail = "Persistencia en PostgreSQL/Neon habilitada."
+                self._init_postgres()
+                return
+            except Exception as exc:
+                self._fallback_to_sqlite(f"falló PostgreSQL/Neon al iniciar: {exc}")
+                return
         self.provider = "sqlite"
         self.enabled = True
         self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}."
@@ -44,7 +64,11 @@ class Persistence:
     @contextmanager
     def connect(self):
         if self.provider == "postgres":
-            conn = psycopg.connect(self.database_url)
+            try:
+                conn = psycopg.connect(self.database_url, connect_timeout=5)
+            except Exception as exc:
+                self._fallback_to_sqlite(f"falló PostgreSQL/Neon en runtime: {exc}")
+                conn = sqlite3.connect(self._sqlite_path)
             try:
                 yield conn
                 conn.commit()

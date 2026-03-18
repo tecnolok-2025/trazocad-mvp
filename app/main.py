@@ -27,28 +27,35 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '6.1.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '64.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SUPPORTED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
-SUPPORTED_SHEETS = {'A4', 'A3', 'A2', 'A1'}
+SUPPORTED_SHEET_SIZES = {'A4', 'A3', 'A2', 'A1'}
 SUPPORTED_DRAWING_TYPES = {'arquitectura', 'mecanico', 'electrico', 'civil', 'layout industrial'}
-SUPPORTED_ORIENTATION = {'AUTO', 'VERTICAL', 'HORIZONTAL'}
-MAX_UPLOAD_MB = int(os.getenv('TRAZOCAD_MAX_UPLOAD_MB', '25'))
+SUPPORTED_ORIENTATIONS = {'AUTO', 'VERTICAL', 'HORIZONTAL'}
+MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', os.getenv('TRAZOCAD_MAX_UPLOAD_MB', '25')))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+EXPECTED_OUTPUTS = {
+    'dxf': 'trazocad_reconstruccion.dxf',
+    'dxf_nube_puntos': 'trazocad_nube_de_puntos.dxf',
+    'report': 'trazocad_plano.pdf',
+    'jpg': 'trazocad_limpio.jpg',
+    'png': 'trazocad_limpio.png',
+}
 
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release profesional: digitalización técnica simple con salidas DXF, PDF, JPG y PNG.',
+    description='TrazoCad release profesional final: digitalización técnica simple con salidas DXF, PDF, JPG y PNG.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 app.mount('/outputs', StaticFiles(directory=OUTPUT_DIR), name='outputs')
 
-executor = ThreadPoolExecutor(max_workers=max(int(os.getenv('TRAZOCAD_WORKERS', '2')), 1))
+executor = ThreadPoolExecutor(max_workers=max(int(os.getenv('TRAZOCAD_WORKERS', '1')), 1))
 job_lock = Lock()
 job_store: dict[str, dict] = {}
 
@@ -71,12 +78,13 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'release profesional',
+        'linea': 'release profesional final',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),
         'servicio': os.getenv('RENDER_SERVICE_NAME', 'local'),
         'persistencia': persistence.provider,
+        'max_upload_mb': str(MAX_UPLOAD_MB),
     }
 
 
@@ -92,6 +100,105 @@ def _public_url_for(path: str) -> str:
 
 def _sharecad_url(file_path: str) -> str:
     return f'https://sharecad.org/cadframe/load?url={quote(_public_url_for(file_path), safe="")}'
+
+
+def _job_output_dir(job_id: str) -> Path:
+    return OUTPUT_DIR / job_id
+
+
+def _output_relpath(job_id: str, filename: str) -> str:
+    return f'/outputs/{job_id}/{filename}'
+
+
+def _downloads_payload(job_id: str) -> dict[str, str]:
+    downloads = {key: _output_relpath(job_id, filename) for key, filename in EXPECTED_OUTPUTS.items()}
+    downloads['abrir_dxf'] = f'/abrir/dxf/{job_id}'
+    downloads['abrir_pdf'] = f'/abrir/pdf/{job_id}'
+    return downloads
+
+
+def _missing_outputs(job_id: str) -> list[str]:
+    output_dir = _job_output_dir(job_id)
+    return [key for key, filename in EXPECTED_OUTPUTS.items() if not (output_dir / filename).exists()]
+
+
+def _preferred_clean_image(result: dict) -> Path:
+    output_files = result.get('output_files', {}) if isinstance(result, dict) else {}
+    for key in ('cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
+        raw = output_files.get(key)
+        if raw and Path(raw).exists():
+            return Path(raw)
+    fallback = _job_output_dir(result.get('job_id', '')) / 'limpio.png'
+    if fallback.exists():
+        return fallback
+    raise FileNotFoundError('No se encontró una imagen limpia de salida para generar JPG, PNG y PDF.')
+
+
+def _result_summary(result: dict, drawing_type: str, sheet_size: str) -> dict[str, str | int | float]:
+    return {
+        'tipo_dibujo': drawing_type,
+        'hoja': sheet_size,
+        'orientacion_hoja': str(result.get('sheet_orientation', 'AUTO')),
+        'orientacion_documento': str(result.get('document_orientation', 'sin-dato')),
+        'lineas': int(result.get('detected_line_count', 0)),
+        'contornos': int(result.get('detected_contour_count', 0)),
+        'escala_mm_px': float(result.get('estimated_scale_mm_per_px', 0)),
+        'precision_clase': str(result.get('precision_class', 'preliminar')),
+    }
+
+
+def _write_manifest(job_dir: Path, payload: dict) -> Path:
+    manifest_path = job_dir / 'manifest.json'
+    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return manifest_path
+
+
+def _recover_done_payload(job_id: str, job: dict | None = None) -> dict | None:
+    if _missing_outputs(job_id):
+        return None
+
+    recovered = dict(job or {})
+    existing_result = recovered.get('result') or {}
+    result = dict(existing_result)
+    result.update(
+        {
+            'job_id': job_id,
+            'brand': 'TrazoCad',
+            'company': 'Tecno Logisti-K SA (TLK)',
+            'version': APP_VERSION,
+            'viewer_mode': 'externo',
+            'runtime': _runtime_version_payload(),
+            'downloads': _downloads_payload(job_id),
+        }
+    )
+    recovered.update(
+        {
+            'job_id': job_id,
+            'state': 'done',
+            'stage': 'completado',
+            'progress': 100,
+            'message': STAGE_MAP['completado']['detail'],
+            'result': result,
+            'error': None,
+            'updated_at': time.time(),
+        }
+    )
+    if 'created_at' not in recovered:
+        recovered['created_at'] = recovered['updated_at']
+    persistence.save_job(recovered)
+    return recovered
+
+
+def _elapsed_fields(job: dict) -> dict[str, float]:
+    now = time.time()
+    created_at = float(job.get('created_at') or now)
+    updated_at = float(job.get('updated_at') or now)
+    return {
+        'created_at': created_at,
+        'updated_at': updated_at,
+        'elapsed_seconds': max(0.0, now - created_at),
+        'last_update_age_seconds': max(0.0, now - updated_at),
+    }
 
 
 def _set_job_stage(job_id: str, stage: str, extra: dict | None = None) -> None:
@@ -112,30 +219,6 @@ def _set_job_stage(job_id: str, stage: str, extra: dict | None = None) -> None:
         persistence.save_job(snapshot)
 
 
-def _validate_process_request(file_name: str, file_bytes: bytes, sheet_size: str, drawing_type: str, sheet_orientation: str) -> tuple[str, str, str]:
-    suffix = Path(file_name or 'plano').suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail='Formato no soportado. Usá PNG, JPG, BMP o TIFF.')
-    if len(file_bytes) == 0:
-        raise HTTPException(status_code=400, detail='El archivo llegó vacío.')
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f'El archivo supera el límite permitido de {MAX_UPLOAD_MB} MB.')
-
-    sheet = str(sheet_size or 'A3').upper()
-    if sheet not in SUPPORTED_SHEETS:
-        raise HTTPException(status_code=400, detail='Tamaño de hoja inválido.')
-
-    drawing = str(drawing_type or 'arquitectura').strip().lower()
-    if drawing not in SUPPORTED_DRAWING_TYPES:
-        raise HTTPException(status_code=400, detail='Tipo de dibujo inválido.')
-
-    orientation = str(sheet_orientation or 'AUTO').upper()
-    if orientation not in SUPPORTED_ORIENTATION:
-        raise HTTPException(status_code=400, detail='Orientación inválida.')
-
-    return suffix, sheet, orientation
-
-
 def _export_raster_variants(source_png: Path, jpg_path: Path, png_path: Path) -> tuple[Path, Path]:
     png_path.write_bytes(source_png.read_bytes())
     with Image.open(source_png) as image:
@@ -143,53 +226,36 @@ def _export_raster_variants(source_png: Path, jpg_path: Path, png_path: Path) ->
     return jpg_path, png_path
 
 
-def _result_summary(result: dict, drawing_type: str, sheet_size: str) -> dict[str, str | int | float]:
-    return {
-        'tipo_dibujo': drawing_type,
-        'hoja': sheet_size,
-        'orientacion_documento': str(result.get('document_orientation', 'sin-dato')),
-        'lineas': int(result.get('detected_line_count', 0)),
-        'contornos': int(result.get('detected_contour_count', 0)),
-        'escala_mm_px': float(result.get('estimated_scale_mm_per_px', 0)),
-        'precision_clase': str(result.get('precision_class', 'preliminar')),
-    }
-
-
-def _write_manifest(job_dir: Path, payload: dict) -> Path:
-    manifest_path = job_dir / 'manifest.json'
-    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-    return manifest_path
-
-
 def _build_result_payload(job_id: str, file_name: str, sheet_size: str, drawing_type: str, result: dict) -> dict:
-    job_dir = OUTPUT_DIR / job_id
+    output_dir = _job_output_dir(job_id)
+    cleaned_source = _preferred_clean_image(result)
+
     dxf_path = export_to_dxf(
-        output_path=job_dir / 'trazocad_reconstruccion.dxf',
+        output_path=output_dir / EXPECTED_OUTPUTS['dxf'],
         geometry=result['geometry'],
         image_width=result['processed_width_px'],
         image_height=result['processed_height_px'],
         mm_per_px=result['estimated_scale_mm_per_px'],
     )
     dxf_points_path = export_to_point_cloud_dxf(
-        output_path=job_dir / 'trazocad_nube_de_puntos.dxf',
+        output_path=output_dir / EXPECTED_OUTPUTS['dxf_nube_puntos'],
         geometry=result['geometry'],
         image_width=result['processed_width_px'],
         image_height=result['processed_height_px'],
         mm_per_px=result['estimated_scale_mm_per_px'],
-        raster_path=Path(result.get('output_files', {}).get('graphics_mask', '')) if result.get('output_files', {}).get('graphics_mask') else None,
+        raster_path=cleaned_source,
     )
     report_path = build_report_pdf(
-        output_path=job_dir / 'trazocad_plano.pdf',
+        output_path=output_dir / EXPECTED_OUTPUTS['report'],
         result=result,
         drawing_type=drawing_type,
         sheet_size=sheet_size,
         original_filename=file_name,
     )
-    cleaned_source = Path(result.get('output_files', {}).get('cleaned_full_image') or result.get('output_files', {}).get('cleaned_image'))
     jpg_path, png_path = _export_raster_variants(
         cleaned_source,
-        job_dir / 'trazocad_limpio.jpg',
-        job_dir / 'trazocad_limpio.png',
+        output_dir / EXPECTED_OUTPUTS['jpg'],
+        output_dir / EXPECTED_OUTPUTS['png'],
     )
 
     payload = dict(result)
@@ -204,18 +270,17 @@ def _build_result_payload(job_id: str, file_name: str, sheet_size: str, drawing_
             'sheet_size': sheet_size,
             'drawing_type': drawing_type,
             'summary': _result_summary(result, drawing_type, sheet_size),
-            'downloads': {
-                'dxf': f'/outputs/{job_id}/{dxf_path.name}',
-                'dxf_nube_puntos': f'/outputs/{job_id}/{dxf_points_path.name}',
-                'report': f'/outputs/{job_id}/{report_path.name}',
-                'jpg': f'/outputs/{job_id}/{jpg_path.name}',
-                'png': f'/outputs/{job_id}/{png_path.name}',
-                'abrir_dxf': f'/abrir/dxf?url=/outputs/{job_id}/{dxf_path.name}',
-                'abrir_pdf': f'/abrir/pdf?url=/outputs/{job_id}/{report_path.name}',
+            'downloads': _downloads_payload(job_id),
+            'artifacts': {
+                'dxf': {'name': dxf_path.name, 'bytes': dxf_path.stat().st_size},
+                'dxf_nube_puntos': {'name': dxf_points_path.name, 'bytes': dxf_points_path.stat().st_size},
+                'report': {'name': report_path.name, 'bytes': report_path.stat().st_size},
+                'jpg': {'name': jpg_path.name, 'bytes': jpg_path.stat().st_size},
+                'png': {'name': png_path.name, 'bytes': png_path.stat().st_size},
             },
         }
     )
-    _write_manifest(job_dir, payload)
+    _write_manifest(output_dir, payload)
     return payload
 
 
@@ -226,8 +291,8 @@ def _start_job(job_id: str, payload: dict) -> None:
     drawing_type: str = payload['drawing_type']
     sheet_orientation: str = payload['sheet_orientation']
     notes: str = payload['notes']
-
     started_at = time.time()
+
     try:
         def progress(stage: str, extra: dict | None = None) -> None:
             _set_job_stage(job_id, stage, extra)
@@ -235,7 +300,7 @@ def _start_job(job_id: str, payload: dict) -> None:
         progress('preparando_archivo')
         pipeline_result = process_drawing(
             input_path=upload_path,
-            output_dir=OUTPUT_DIR / job_id,
+            output_dir=_job_output_dir(job_id),
             sheet_size=sheet_size,
             drawing_type=drawing_type,
             reference_mm=None,
@@ -252,6 +317,9 @@ def _start_job(job_id: str, payload: dict) -> None:
             drawing_type=drawing_type,
             result=pipeline_result.to_dict(),
         )
+        missing = _missing_outputs(job_id)
+        if missing:
+            raise RuntimeError(f'La tarea terminó sin generar todas las salidas esperadas: {", ".join(missing)}.')
         duration = round(time.time() - started_at, 2)
         progress('finalizando', {'elapsed_seconds': duration})
         with job_lock:
@@ -263,7 +331,6 @@ def _start_job(job_id: str, payload: dict) -> None:
                     'stage': 'completado',
                     'progress': 100,
                     'message': STAGE_MAP['completado']['detail'],
-                    'elapsed_seconds': duration,
                     'result': response_payload,
                     'error': None,
                 }
@@ -281,11 +348,17 @@ def _start_job(job_id: str, payload: dict) -> None:
                     'progress': 100,
                     'message': f'Se produjo un error durante el proceso: {exc}',
                     'error': str(exc),
-                    'traceback': traceback.format_exc(limit=5),
+                    'traceback': traceback.format_exc(limit=6),
                 }
             )
             job_store[job_id] = job
         persistence.save_job(job)
+    finally:
+        try:
+            if upload_path.exists():
+                upload_path.unlink()
+        except OSError:
+            pass
 
 
 @app.get('/')
@@ -293,24 +366,14 @@ def home() -> FileResponse:
     return FileResponse(STATIC_DIR / 'index.html')
 
 
-@app.get('/health')
-def health() -> dict[str, str]:
-    return {'status': 'ok', 'service': 'TrazoCad', 'company': 'Tecno Logisti-K SA (TLK)', 'version': APP_VERSION}
-
-
 @app.get('/manual')
 def manual() -> FileResponse:
     return FileResponse(STATIC_DIR / 'manual.html')
 
 
-@app.get('/abrir/dxf')
-def abrir_dxf(url: str):
-    return RedirectResponse(_sharecad_url(url))
-
-
-@app.get('/abrir/pdf')
-def abrir_pdf(url: str):
-    return RedirectResponse(_public_url_for(url))
+@app.get('/health')
+def health() -> dict[str, str]:
+    return {'status': 'ok', 'service': 'TrazoCad', 'company': 'Tecno Logisti-K SA (TLK)', 'version': APP_VERSION}
 
 
 @app.get('/version')
@@ -329,13 +392,30 @@ def infra() -> JSONResponse:
                 'servicio': os.getenv('RENDER_SERVICE_NAME', 'local'),
                 'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
                 'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
-                'base_publica': _public_base_url() or 'no configurada',
-                'nota': 'La línea profesional sigue recomendando revisar tiempos de proceso en planes free.',
+                'nota': 'La release privilegia estabilidad y puede usar SQLite local como fallback si PostgreSQL/Neon no responde.',
             },
             'persistencia': persistence.stats(),
-            'alcance': 'Release profesional: flujo asíncrono, DXF limpio, DXF nube de puntos independiente, PDF de presentación y descargas directas.',
+            'alcance': 'Release profesional final: interfaz mínima, proceso asíncrono estable, PDF mejor presentado y salidas DXF/PDF/JPG/PNG.',
         }
     )
+
+
+@app.get('/abrir/dxf/{job_id}')
+def abrir_dxf(job_id: str):
+    target = _job_output_dir(job_id) / EXPECTED_OUTPUTS['dxf']
+    if not target.exists():
+        raise HTTPException(status_code=404, detail='No se encontró el DXF solicitado para esta tarea.')
+    if _public_base_url():
+        return RedirectResponse(_sharecad_url(_output_relpath(job_id, EXPECTED_OUTPUTS['dxf'])))
+    return FileResponse(target, filename=target.name, media_type='application/dxf')
+
+
+@app.get('/abrir/pdf/{job_id}')
+def abrir_pdf(job_id: str):
+    target = _job_output_dir(job_id) / EXPECTED_OUTPUTS['report']
+    if not target.exists():
+        raise HTTPException(status_code=404, detail='No se encontró el PDF solicitado para esta tarea.')
+    return RedirectResponse(_public_url_for(_output_relpath(job_id, EXPECTED_OUTPUTS['report'])))
 
 
 @app.post('/api/process')
@@ -346,44 +426,67 @@ async def process_file(
     notes: str = Form(''),
     sheet_orientation: str = Form('AUTO'),
 ) -> JSONResponse:
-    file_name = file.filename or 'plano'
-    raw = await file.read()
-    suffix, sheet, orientation = _validate_process_request(file_name, raw, sheet_size, drawing_type, sheet_orientation)
+    filename = (file.filename or '').strip()
+    suffix = Path(filename or 'plano').suffix.lower()
+    if not filename:
+        raise HTTPException(status_code=400, detail='No se recibió ningún archivo para procesar.')
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail='Formato no soportado. Usá PNG, JPG, BMP o TIFF.')
+
+    normalized_sheet_size = sheet_size.upper().strip()
+    if normalized_sheet_size not in SUPPORTED_SHEET_SIZES:
+        raise HTTPException(status_code=400, detail='Tamaño de hoja no válido. Usá A4, A3, A2 o A1.')
+
+    normalized_drawing_type = drawing_type.strip().lower()
+    if normalized_drawing_type not in SUPPORTED_DRAWING_TYPES:
+        raise HTTPException(status_code=400, detail='Tipo de dibujo no válido.')
+
+    normalized_orientation = sheet_orientation.upper().strip() or 'AUTO'
+    if normalized_orientation not in SUPPORTED_ORIENTATIONS:
+        raise HTTPException(status_code=400, detail='Orientación no válida. Usá AUTO, VERTICAL u HORIZONTAL.')
+
+    normalized_notes = notes.strip()
+    if len(normalized_notes) > 600:
+        raise HTTPException(status_code=400, detail='Las notas son demasiado largas. Usá hasta 600 caracteres.')
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail='El archivo llegó vacío. Probá nuevamente con una imagen válida.')
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f'El archivo supera el máximo permitido de {MAX_UPLOAD_MB} MB.')
 
     job_id = uuid4().hex[:12]
     upload_path = UPLOAD_DIR / f'{job_id}{suffix}'
-    output_dir = OUTPUT_DIR / job_id
+    output_dir = _job_output_dir(job_id)
     output_dir.mkdir(parents=True, exist_ok=True)
-    upload_path.write_bytes(raw)
+    upload_path.write_bytes(raw_bytes)
 
+    initial_job = {
+        'job_id': job_id,
+        'state': 'queued',
+        'stage': 'cola',
+        'progress': STAGE_MAP['cola']['percent'],
+        'message': STAGE_MAP['cola']['detail'],
+        'file_name': filename or upload_path.name,
+        'result': None,
+        'error': None,
+        'created_at': time.time(),
+        'updated_at': time.time(),
+    }
     with job_lock:
-        job_store[job_id] = {
-            'job_id': job_id,
-            'state': 'queued',
-            'stage': 'cola',
-            'progress': STAGE_MAP['cola']['percent'],
-            'message': STAGE_MAP['cola']['detail'],
-            'file_name': file_name,
-            'sheet_size': sheet,
-            'drawing_type': drawing_type,
-            'result': None,
-            'error': None,
-            'created_at': time.time(),
-            'updated_at': time.time(),
-        }
-        persistence.save_job(job_store[job_id])
+        job_store[job_id] = initial_job
+    persistence.save_job(initial_job)
 
     executor.submit(
         _start_job,
         job_id,
         {
             'upload_path': upload_path,
-            'output_dir': output_dir,
-            'file_name': file_name,
-            'sheet_size': sheet,
-            'drawing_type': drawing_type,
-            'sheet_orientation': orientation,
-            'notes': notes[:800],
+            'file_name': filename or upload_path.name,
+            'sheet_size': normalized_sheet_size,
+            'drawing_type': normalized_drawing_type,
+            'sheet_orientation': normalized_orientation,
+            'notes': normalized_notes,
         },
     )
     return JSONResponse(
@@ -394,6 +497,8 @@ async def process_file(
             'progress': STAGE_MAP['cola']['percent'],
             'message': STAGE_MAP['cola']['detail'],
             'version': APP_VERSION,
+            'max_upload_mb': MAX_UPLOAD_MB,
+            'downloads': _downloads_payload(job_id),
         }
     )
 
@@ -409,21 +514,29 @@ def process_status(job_id: str) -> JSONResponse:
         job = job_mem or job_db
 
     if not job:
-        output_dir = OUTPUT_DIR / job_id
-        if output_dir.exists():
-            return JSONResponse(
-                {
-                    'job_id': job_id,
-                    'state': 'recovering',
-                    'stage': 'cola',
-                    'progress': 5,
-                    'message': 'La tarea existe en disco, pero el servidor todavía está reconstruyendo su estado.',
-                    'version': APP_VERSION,
-                    'updated_at': time.time(),
-                    'warning': 'Recuperación de estado en progreso.',
-                }
-            )
-        raise HTTPException(status_code=404, detail='No se encontró la tarea solicitada.')
+        recovered = _recover_done_payload(job_id)
+        if recovered:
+            job = recovered
+        else:
+            output_dir = _job_output_dir(job_id)
+            if output_dir.exists():
+                return JSONResponse(
+                    {
+                        'job_id': job_id,
+                        'state': 'recovering',
+                        'stage': 'cola',
+                        'progress': 5,
+                        'message': 'La tarea existe en disco, pero el servidor todavía está reconstruyendo su estado.',
+                        'version': APP_VERSION,
+                        'updated_at': time.time(),
+                        'warning': 'Recuperación de estado en progreso.',
+                    }
+                )
+            raise HTTPException(status_code=404, detail='No se encontró la tarea solicitada.')
+    elif job.get('state') == 'done' and not job.get('result'):
+        recovered = _recover_done_payload(job_id, job=job)
+        if recovered:
+            job = recovered
 
     payload = {
         'job_id': job_id,
@@ -432,9 +545,8 @@ def process_status(job_id: str) -> JSONResponse:
         'progress': job.get('progress', 0),
         'message': job.get('message', 'Sin novedades por el momento.'),
         'version': APP_VERSION,
-        'updated_at': job.get('updated_at', time.time()),
         'persistencia': persistence.provider,
-        'elapsed_seconds': job.get('elapsed_seconds'),
+        **_elapsed_fields(job),
     }
     if job.get('state') == 'done':
         payload['result'] = job.get('result')
@@ -449,21 +561,13 @@ def product_state() -> dict:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'etapa': 'Release profesional',
-        'estado': 'operativo',
-        'cierre': 'Flujo principal reducido a carga, proceso, apertura y descarga de archivos técnicos.',
-        'capacidades_clave': [
-            'proceso asíncrono con seguimiento de estado',
-            'DXF vectorizado limpio',
-            'DXF nube de puntos con base raster independiente',
-            'PDF de presentación por hoja solicitada',
-            'JPG y PNG limpios',
-            'apertura externa de DXF y apertura directa de PDF',
-        ],
-        'criterios': [
-            'simplicidad de interfaz',
+        'estado': 'release profesional final',
+        'criterio': [
+            'interfaz simple',
+            'DXF limpio',
+            'PDF de mejor presentación',
             'no deformación',
-            'orientación correcta',
-            'presentación profesional del plano',
+            'apertura sin visor DXF interno',
         ],
+        'salidas': list(EXPECTED_OUTPUTS.keys()),
     }

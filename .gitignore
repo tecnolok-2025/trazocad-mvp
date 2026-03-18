@@ -14,3 +14,6 @@ data/uploads/*
 data/outputs/*
 !data/uploads/.gitkeep
 !data/outputs/.gitkeep
+
+# local persistence
+data/trazocad_local.db

@@ -13,13 +13,21 @@ const progressFill = document.getElementById('progressFill');
 const progressTrack = document.querySelector('.progress-track');
 const errorBox = document.getElementById('errorBox');
 const resultsCard = document.getElementById('resultsCard');
+const summaryStrip = document.getElementById('summaryStrip');
 const dxfActions = document.getElementById('dxfActions');
 const pdfActions = document.getElementById('pdfActions');
 const imageActions = document.getElementById('imageActions');
-const summaryStrip = document.getElementById('summaryStrip');
 
-let pollingTimer = null;
+const CURRENT_JOB_STORAGE_KEY = 'trazocad.currentJobId';
+const MAX_UPLOAD_MB = 25;
+const POLL_INTERVAL_MS = 2500;
+const MAX_POLL_FAILURES = 6;
+const ALLOWED_EXTENSIONS = ['png', 'jpg', 'jpeg', 'bmp', 'tif', 'tiff'];
+
 let currentJobId = null;
+let pollHandle = null;
+let pollFailureCount = 0;
+let isBusy = false;
 let pollingStartedAt = null;
 
 const ACTION_GROUPS = {
@@ -45,10 +53,18 @@ function setProgress(value) {
   progressTrack.setAttribute('aria-valuenow', String(safeValue));
 }
 
-function setBusy(isBusy) {
-  submitButton.disabled = isBusy;
-  submitButton.textContent = isBusy ? 'Procesando…' : 'Procesar';
-  fileInput.disabled = isBusy;
+function formatSeconds(seconds) {
+  const safeSeconds = Math.max(0, Math.round(Number(seconds) || 0));
+  const mins = Math.floor(safeSeconds / 60);
+  const secs = safeSeconds % 60;
+  return mins > 0 ? `${mins} min ${secs.toString().padStart(2, '0')} s` : `${secs} s`;
+}
+
+function setBusy(nextBusy) {
+  isBusy = nextBusy;
+  submitButton.disabled = nextBusy;
+  submitButton.textContent = nextBusy ? 'Procesando…' : 'Procesar';
+  fileInput.disabled = nextBusy;
 }
 
 function showError(message) {
@@ -63,19 +79,26 @@ function clearError() {
 
 function resetResults() {
   resultsCard.classList.add('hidden');
+  summaryStrip.innerHTML = '';
   dxfActions.innerHTML = '';
   pdfActions.innerHTML = '';
   imageActions.innerHTML = '';
-  summaryStrip.innerHTML = '';
 }
 
-function formatSeconds(value) {
-  const seconds = Math.max(0, Math.round(Number(value) || 0));
-  if (!seconds) return '—';
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return `${minutes}m ${rest}s`;
+function stopPolling() {
+  if (pollHandle) {
+    clearTimeout(pollHandle);
+    pollHandle = null;
+  }
+}
+
+function persistCurrentJob(jobId) {
+  currentJobId = jobId || null;
+  if (currentJobId) {
+    window.localStorage.setItem(CURRENT_JOB_STORAGE_KEY, currentJobId);
+  } else {
+    window.localStorage.removeItem(CURRENT_JOB_STORAGE_KEY);
+  }
 }
 
 function createActionLink({ href, label, download = false }) {
@@ -139,7 +162,9 @@ function updateStatus(payload) {
     ? 'El proceso terminó correctamente. Ya podés abrir o descargar los archivos.'
     : state === 'error'
       ? 'La tarea terminó con error. Revisá el mensaje mostrado arriba.'
-      : 'Procesando el archivo en segundo plano.';
+      : state === 'recovering'
+        ? 'El servidor está reconstruyendo el estado de la tarea. No cierres esta pestaña.'
+        : 'Procesando el archivo en segundo plano.';
   stageLabel.textContent = `Etapa: ${stage.replaceAll('_', ' ')}`;
   jobLabel.textContent = `Job: ${payload?.job_id || '—'}`;
   const elapsed = payload?.elapsed_seconds || (pollingStartedAt ? (Date.now() - pollingStartedAt) / 1000 : 0);
@@ -147,58 +172,117 @@ function updateStatus(payload) {
   setProgress(payload?.progress || 0);
 }
 
+function validateSelectedFile(file) {
+  if (!file) return 'Seleccioná un archivo antes de procesar.';
+  const extension = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
+  if (!ALLOWED_EXTENSIONS.includes(extension)) return 'Formato no soportado. Usá PNG, JPG, BMP o TIFF.';
+  if (file.size <= 0) return 'El archivo seleccionado está vacío.';
+  if (file.size > MAX_UPLOAD_MB * 1024 * 1024) return `El archivo supera el máximo recomendado de ${MAX_UPLOAD_MB} MB.`;
+  return null;
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  let payload = {};
+  try {
+    payload = await response.json();
+  } catch (_error) {
+    payload = {};
+  }
+  if (!response.ok) {
+    throw new Error(payload?.detail || payload?.message || 'La operación no se pudo completar.');
+  }
+  return payload;
+}
+
 async function fetchVersion() {
   try {
-    const response = await fetch('/version');
-    if (!response.ok) return;
-    const payload = await response.json();
+    const payload = await fetchJson('/version');
     if (payload?.version) versionBadge.textContent = `Versión ${payload.version}`;
   } catch (_error) {
-    // no bloquea interfaz
+    // No bloquea la interfaz.
   }
 }
 
-async function pollStatus(jobId) {
-  try {
-    const response = await fetch(`/api/process/${jobId}/status`, { cache: 'no-store' });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload?.detail || 'No se pudo consultar el estado del proceso.');
+function scheduleNextPoll(delay = POLL_INTERVAL_MS) {
+  stopPolling();
+  if (!currentJobId) return;
+  pollHandle = window.setTimeout(() => pollStatus(currentJobId), delay);
+}
 
+async function pollStatus(jobId) {
+  if (!jobId) return;
+
+  try {
+    const payload = await fetchJson(`/api/process/${jobId}/status`, { cache: 'no-store' });
+    pollFailureCount = 0;
     updateStatus(payload);
 
     if (payload.state === 'done') {
-      clearInterval(pollingTimer);
-      pollingTimer = null;
+      stopPolling();
       setBusy(false);
       clearError();
       renderResults(payload.result);
+      persistCurrentJob(null);
       return;
     }
 
     if (payload.state === 'error') {
-      clearInterval(pollingTimer);
-      pollingTimer = null;
+      stopPolling();
       setBusy(false);
       resetResults();
       showError(payload.error || 'La tarea terminó con error.');
+      persistCurrentJob(null);
+      return;
     }
+
+    setBusy(true);
+    scheduleNextPoll();
   } catch (error) {
-    clearInterval(pollingTimer);
-    pollingTimer = null;
-    setBusy(false);
-    resetResults();
-    showError(error.message || 'No se pudo consultar el estado del proceso.');
+    pollFailureCount += 1;
+    if (pollFailureCount >= 2) {
+      statusDetail.textContent = 'Se perdió contacto momentáneamente con el servidor. Reintentando…';
+    }
+
+    if (pollFailureCount >= MAX_POLL_FAILURES) {
+      stopPolling();
+      setBusy(false);
+      resetResults();
+      showError(error.message || 'No se pudo consultar el estado del proceso.');
+      return;
+    }
+
+    scheduleNextPoll(POLL_INTERVAL_MS + pollFailureCount * 1500);
   }
+}
+
+async function restoreJobIfNeeded() {
+  const storedJobId = window.localStorage.getItem(CURRENT_JOB_STORAGE_KEY);
+  if (!storedJobId) return;
+
+  persistCurrentJob(storedJobId);
+  pollingStartedAt = Date.now();
+  setBusy(true);
+  statusMessage.textContent = 'Recuperando tarea previa…';
+  statusDetail.textContent = 'Se encontró una tarea anterior y se está consultando su estado.';
+  stageLabel.textContent = 'Etapa: recuperando';
+  jobLabel.textContent = `Job: ${storedJobId}`;
+  timeLabel.textContent = 'Tiempo: 0 s';
+  setProgress(5);
+  await pollStatus(storedJobId);
 }
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (isBusy) return;
+
   clearError();
   resetResults();
 
   const file = fileInput.files?.[0];
-  if (!file) {
-    showError('Seleccioná un archivo antes de procesar.');
+  const validationError = validateSelectedFile(file);
+  if (validationError) {
+    showError(validationError);
     return;
   }
 
@@ -210,18 +294,14 @@ form.addEventListener('submit', async (event) => {
   statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano.';
   stageLabel.textContent = 'Etapa: cola';
   jobLabel.textContent = 'Job: preparando';
-  timeLabel.textContent = 'Tiempo: 0s';
+  timeLabel.textContent = 'Tiempo: 0 s';
 
   try {
-    const response = await fetch('/api/process', { method: 'POST', body: formData });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload?.detail || 'No se pudo iniciar el proceso.');
-
-    currentJobId = payload.job_id;
+    const payload = await fetchJson('/api/process', { method: 'POST', body: formData });
+    persistCurrentJob(payload.job_id);
     updateStatus(payload);
-    if (pollingTimer) clearInterval(pollingTimer);
-    pollingTimer = setInterval(() => pollStatus(currentJobId), 2500);
-    pollStatus(currentJobId);
+    pollFailureCount = 0;
+    scheduleNextPoll(500);
   } catch (error) {
     setBusy(false);
     setProgress(0);
@@ -242,3 +322,4 @@ fileInput.addEventListener('change', () => {
 });
 
 fetchVersion();
+restoreJobIfNeeded();

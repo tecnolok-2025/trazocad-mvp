@@ -1,12 +1,11 @@
 # Changelog
 
-## v61.0.0 — Release profesional
+## v64.0.0 — Release profesional final
 
-- interfaz mínima consolidada con orientación de hoja visible
-- validaciones de archivo, tamaño y parámetros del flujo principal
-- PDF de presentación ajustado al tamaño de hoja solicitado
-- DXF nube de puntos con preferencia por máscara raster limpia
-- manifest por trabajo con resumen y enlaces de salida
-- apertura de DXF/PDF resuelta por rutas propias de la app
-- mejora del preprocesado para reducir tiempos de ejecución
-- documentación y manual alineados con la release final
+- interfaz mínima profesional con orientación de hoja
+- proceso asíncrono estable con reanudación por job
+- fallback seguro de persistencia a SQLite cuando PostgreSQL/Neon falla
+- PDF de presentación por hoja solicitada y sin deformación
+- DXF nube de puntos con fallback raster
+- manifest de resultados por job
+- apertura externa de DXF cuando hay URL pública y fallback local a entrega directa del archivo

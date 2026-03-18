@@ -1,18 +1,20 @@
-# TrazoCad v61 — Release profesional
+# TrazoCad v64 — Release profesional final
 
 TrazoCad es una aplicación de Tecno Logisti-K SA (TLK) para digitalizar croquis, fotos o planos escaneados y generar salidas técnicas limpias.
 
 ## Alcance actual
 
-La v61 consolida una línea de trabajo profesional centrada en:
+La v64 consolida una línea de trabajo profesional centrada en:
 
 - carga de imagen
-- procesamiento asíncrono
+- procesamiento asíncrono robusto
+- recuperación de estado por job
+- persistencia con fallback seguro a SQLite
 - DXF vectorizado limpio
 - DXF nube de puntos con fallback raster
 - PDF de presentación por hoja solicitada
 - JPG y PNG de salida
-- apertura externa de DXF
+- apertura externa de DXF cuando existe URL pública
 - apertura directa de PDF
 
 ## Qué no incluye esta versión
@@ -59,8 +61,8 @@ Rutas principales:
 - `GET /health`
 - `GET /version`
 - `GET /infra`
-- `GET /abrir/dxf?url=...`
-- `GET /abrir/pdf?url=...`
+- `GET /abrir/dxf/{job_id}`
+- `GET /abrir/pdf/{job_id}`
 - `POST /api/process`
 - `GET /api/process/{job_id}/status`
 
@@ -74,6 +76,6 @@ Rutas principales:
 
 ## Notas de esta release
 
-- El PDF ya respeta el tamaño de hoja solicitado y encuadra el contenido sin deformación.
+- El PDF respeta el tamaño de hoja solicitado y encuadra el contenido sin deformación.
 - La nube de puntos intenta usar una base raster limpia antes de caer al muestreo geométrico.
-- La optimización profunda del pipeline todavía puede seguir mejorándose en una etapa posterior de performance.
+- Si PostgreSQL/Neon falla al arrancar en Render, la app cae automáticamente a SQLite local para no perder disponibilidad.
