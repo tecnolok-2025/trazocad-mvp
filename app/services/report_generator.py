@@ -31,7 +31,7 @@ def _resolve_sheet_size(sheet_size: str, orientation: str) -> tuple[float, float
 
 def _find_candidate_image(result: dict[str, Any]) -> Path | None:
     output_files = result.get('output_files', {}) if isinstance(result, dict) else {}
-    for key in ('cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
+    for key in ('presentation_image', 'cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
         raw = output_files.get(key)
         if raw and Path(raw).exists():
             return Path(raw)
@@ -43,7 +43,7 @@ def _crop_content(path: Path, padding_px: int = 24) -> Path:
     with Image.open(path) as image:
         rgb = image.convert('RGB')
         inverted = ImageOps.invert(rgb.convert('L'))
-        bbox = inverted.point(lambda p: 255 if p > 12 else 0).getbbox()
+        bbox = inverted.point(lambda p: 255 if p > 6 else 0).getbbox()
         if bbox is None:
             rgb.save(cropped_path)
             return cropped_path

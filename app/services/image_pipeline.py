@@ -1004,6 +1004,16 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
         cv2.rectangle(clean, (item["x"], item["y"]), (item["x"] + item["w"], item["y"] + item["h"]), (170, 170, 220), 1)
     return clean
 
+def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray) -> np.ndarray:
+    # Prioriza fidelidad visual del plano completo: conserva rótulos, textos y cotas como imagen limpia.
+    base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+    _, soft = cv2.threshold(base_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    soft = cv2.medianBlur(soft, 3)
+    # Recupera trazos finos del binario para que no se pierdan líneas punteadas ni cuadriculados de rótulo.
+    recovered = cv2.bitwise_or(cv2.bitwise_not(soft), binary)
+    presentation = cv2.cvtColor(cv2.bitwise_not(recovered), cv2.COLOR_GRAY2BGR)
+    return presentation
+
 
 def _insights(
     reference_mode: str,
@@ -1220,7 +1230,7 @@ def process_drawing(
         progress_callback("reconociendo_texto")
     ocr_items = []
     ocr_engine = "desactivado"
-    ocr_warning = "OCR desactivado temporalmente para priorizar estabilidad y evitar bloqueos en Render Free."
+    ocr_warning = "OCR todavía no está incorporado como salida productiva. En esta versión se prioriza preservar visualmente rótulos, notas y cotas en PDF/JPG/PNG y en el DXF nube de puntos."
     cota_texts, rotulo_texts, general_texts = [], [], []
     if progress_callback:
         progress_callback("vectorizando_geometria")
@@ -1312,14 +1322,17 @@ def process_drawing(
     reconstruction_preview = enhanced_bgr.copy()
     analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
     vector_base = _build_vector_base(graphics_binary, ocr_items)
+    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"
     cleaned_path = output_dir / "limpio.png"
+    presentation_path = output_dir / "presentacion.png"
     overlay_path = output_dir / "overlay.png"
     original_path = output_dir / "original_preview.png"
     _save_image(reconstruction_path, _resize_for_report(reconstruction_preview))
     _save_image(cleaned_path, _resize_for_report(vector_base))
+    _save_image(presentation_path, _resize_for_report(presentation_base))
     _save_image(overlay_path, _resize_for_report(overlay))
     _save_image(original_path, _resize_for_report(analysis_preview))
 
@@ -1395,6 +1408,7 @@ def process_drawing(
         output_files={
             "reconstruction_preview": str(reconstruction_path),
             "cleaned_image": str(cleaned_path),
+            "presentation_image": str(presentation_path),
             "overlay_image": str(overlay_path),
             "original_preview": str(original_path),
         },

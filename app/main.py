@@ -27,7 +27,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '64.0.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '65.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,7 +49,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release profesional final: digitalización técnica simple con salidas DXF, PDF, JPG y PNG.',
+    description='TrazoCad release de fidelidad mejorada: presentación más fiel del plano, DXF/PDF/JPG/PNG y fallback raster para textos y rótulos.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -395,7 +395,7 @@ def infra() -> JSONResponse:
                 'nota': 'La release privilegia estabilidad y puede usar SQLite local como fallback si PostgreSQL/Neon no responde.',
             },
             'persistencia': persistence.stats(),
-            'alcance': 'Release profesional final: interfaz mínima, proceso asíncrono estable, PDF mejor presentado y salidas DXF/PDF/JPG/PNG.',
+            'alcance': 'Release de fidelidad mejorada: presentación más fiel del plano, mejor preservación de rótulos/textos en PDF/JPG/PNG y DXF nube de puntos con base raster.',
         }
     )
 
@@ -565,7 +565,7 @@ def product_state() -> dict:
         'criterio': [
             'interfaz simple',
             'DXF limpio',
-            'PDF de mejor presentación',
+            'PDF de mayor fidelidad visual',
             'no deformación',
             'apertura sin visor DXF interno',
         ],
