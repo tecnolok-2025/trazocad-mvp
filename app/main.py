@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import shutil
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +29,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '67.0.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '68.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,6 +40,8 @@ SUPPORTED_DRAWING_TYPES = {'arquitectura', 'mecanico', 'electrico', 'civil', 'la
 SUPPORTED_ORIENTATIONS = {'AUTO', 'VERTICAL', 'HORIZONTAL'}
 MAX_UPLOAD_MB = int(os.getenv('MAX_UPLOAD_MB', os.getenv('TRAZOCAD_MAX_UPLOAD_MB', '25')))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_EMBEDDED_UPLOAD_MB = int(os.getenv('TRAZOCAD_EMBEDDED_UPLOAD_MB', '8'))
+MAX_EMBEDDED_UPLOAD_BYTES = MAX_EMBEDDED_UPLOAD_MB * 1024 * 1024
 EXPECTED_OUTPUTS = {
     'dxf': 'trazocad_reconstruccion.dxf',
     'dxf_nube_puntos': 'trazocad_nube_de_puntos.dxf',
@@ -49,7 +53,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release de OCR dirigido y reconstrucción documental: presentación más fiel del plano, OCR por regiones, DXF/PDF/JPG/PNG y reconstrucción base más inteligente.',
+    description='TrazoCad release de continuidad duradera y reconstrucción estructural base: reintento robusto de tareas, OCR seguro por presupuesto y mejor cierre de trazos.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -214,6 +218,48 @@ def _job_meta_payload(upload_path: Path, output_dir: Path, file_name: str, sheet
     }
 
 
+def _maybe_embed_upload(raw_bytes: bytes, suffix: str) -> dict[str, str] | None:
+    if not raw_bytes or len(raw_bytes) > MAX_EMBEDDED_UPLOAD_BYTES:
+        return None
+    return {
+        'encoding': 'base64',
+        'suffix': suffix,
+        'size_bytes': str(len(raw_bytes)),
+        'data': base64.b64encode(raw_bytes).decode('ascii'),
+    }
+
+
+def _restore_upload_from_meta(meta: dict) -> Path | None:
+    upload_raw = meta.get('upload_path')
+    upload_path = Path(upload_raw) if upload_raw else None
+    if upload_path and upload_path.exists():
+        return upload_path
+    blob = meta.get('upload_blob')
+    if not blob or blob.get('encoding') != 'base64' or not upload_path:
+        return None
+    try:
+        upload_path.parent.mkdir(parents=True, exist_ok=True)
+        upload_path.write_bytes(base64.b64decode(blob['data'].encode('ascii')))
+        return upload_path
+    except Exception:
+        return None
+
+
+def _clean_output_dir(job_id: str) -> None:
+    output_dir = _job_output_dir(job_id)
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return
+    for child in output_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _resume_job_if_possible(job_id: str, job: dict) -> bool:
     if job.get('state') in {'done', 'error'}:
         return False
@@ -221,8 +267,8 @@ def _resume_job_if_possible(job_id: str, job: dict) -> bool:
     upload_raw = meta.get('upload_path')
     if not upload_raw:
         return False
-    upload_path = Path(upload_raw)
-    if not upload_path.exists():
+    upload_path = _restore_upload_from_meta(meta)
+    if not upload_path or not upload_path.exists():
         return False
     with job_lock:
         current = job_store.get(job_id)
@@ -501,6 +547,19 @@ async def process_file(
     output_dir.mkdir(parents=True, exist_ok=True)
     upload_path.write_bytes(raw_bytes)
 
+    meta = _job_meta_payload(
+        upload_path=upload_path,
+        output_dir=output_dir,
+        file_name=filename or upload_path.name,
+        sheet_size=normalized_sheet_size,
+        drawing_type=normalized_drawing_type,
+        sheet_orientation=normalized_orientation,
+        notes=normalized_notes,
+    )
+    embedded_upload = _maybe_embed_upload(raw_bytes, suffix)
+    if embedded_upload:
+        meta['upload_blob'] = embedded_upload
+
     initial_job = {
         'job_id': job_id,
         'state': 'queued',
@@ -508,15 +567,7 @@ async def process_file(
         'progress': STAGE_MAP['cola']['percent'],
         'message': STAGE_MAP['cola']['detail'],
         'file_name': filename or upload_path.name,
-        'meta': _job_meta_payload(
-            upload_path=upload_path,
-            output_dir=output_dir,
-            file_name=filename or upload_path.name,
-            sheet_size=normalized_sheet_size,
-            drawing_type=normalized_drawing_type,
-            sheet_orientation=normalized_orientation,
-            notes=normalized_notes,
-        ),
+        'meta': meta,
         'result': None,
         'error': None,
         'created_at': time.time(),
@@ -539,6 +590,42 @@ async def process_file(
             'downloads': _downloads_payload(job_id),
         }
     )
+
+
+@app.post('/api/process/{job_id}/retry')
+def retry_process(job_id: str) -> JSONResponse:
+    with job_lock:
+        existing = job_store.get(job_id)
+    job = existing or persistence.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='No se encontró la tarea original para reintentarla.')
+    if job.get('state') in {'queued', 'running'}:
+        return JSONResponse({'job_id': job_id, 'state': job.get('state'), 'message': 'La tarea ya está activa.'})
+    if job.get('state') == 'done' and not _missing_outputs(job_id):
+        recovered = _recover_done_payload(job_id, job=job) or job
+        return JSONResponse({'job_id': job_id, 'state': 'done', 'result': recovered.get('result'), 'message': 'La tarea ya estaba completada.'})
+
+    meta = dict(job.get('meta') or {})
+    upload_path = _restore_upload_from_meta(meta)
+    if not upload_path or not upload_path.exists():
+        raise HTTPException(status_code=409, detail='No quedó una copia recuperable del archivo original para reintentar esta tarea. Conviene volver a subir el plano.')
+
+    _clean_output_dir(job_id)
+    restarted = dict(job)
+    restarted.update({
+        'state': 'queued',
+        'stage': 'cola',
+        'progress': STAGE_MAP['cola']['percent'],
+        'message': 'Se relanzó automáticamente la tarea después de una interrupción.',
+        'error': None,
+        'result': None,
+        'updated_at': time.time(),
+    })
+    with job_lock:
+        job_store[job_id] = restarted
+    persistence.save_job(restarted)
+    executor.submit(_start_job, job_id, meta)
+    return JSONResponse({'job_id': job_id, 'state': 'queued', 'stage': 'cola', 'progress': STAGE_MAP['cola']['percent'], 'message': restarted['message'], 'version': APP_VERSION})
 
 
 @app.get('/api/process/{job_id}/status')
@@ -579,7 +666,7 @@ def process_status(job_id: str) -> JSONResponse:
                     'message': 'El servidor perdió el estado de la tarea antes de completarla. Esto suele pasar por un reinicio del proceso o una caída transitoria de persistencia.',
                     'version': APP_VERSION,
                     'updated_at': time.time(),
-                    'error': 'La tarea ya no está disponible para continuar en este servidor.',
+                    'error': 'La tarea ya no está disponible para continuar en este servidor. Se puede intentar un reintento automático si existe una copia del archivo original.',
                 }
             )
     elif job.get('state') == 'done' and not job.get('result'):

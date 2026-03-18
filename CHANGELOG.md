@@ -1,6 +1,7 @@
-## 67.0.0
-- OCR dirigido por regiones
-- mejora de reconstrucción raster para cerrar trazos débiles
-- PDF con mayor aprovechamiento de hoja
-- DXF con capas de textos/cotas/rótulo cuando OCR reconoce contenido
-- ayuda guiada en interfaz para notas opcionales
+# Changelog
+
+## 68.0.0
+- Recuperación y reintento robusto de tareas interrumpidas.
+- Persistencia opcional del archivo original en la metadata del job para reanudar/reintentar.
+- OCR en modo seguro por presupuesto de tiempo/regiones.
+- Reconstrucción estructural base para cerrar microcortes.

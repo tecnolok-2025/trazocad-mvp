@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from collections import defaultdict
 import math
+import os
+import time
 
 import cv2
 import numpy as np
@@ -127,6 +129,33 @@ def _blend_min(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return cv2.min(a, b)
 
 
+def _ocr_budgets(directives: dict[str, bool] | None = None) -> dict[str, float | int]:
+    directives = directives or {}
+    wants_documental = directives.get('preserve_title_block') or directives.get('prioritize_dimensions')
+    wants_heavy = wants_documental and directives.get('prioritize_fidelity')
+    return {
+        'max_boxes': 28 if wants_heavy else 18 if wants_documental else 10,
+        'pixel_fraction': 0.24 if wants_heavy else 0.16 if wants_documental else 0.10,
+        'time_budget_s': float(os.getenv('TRAZOCAD_OCR_TIME_BUDGET_S', '20' if wants_heavy else '12' if wants_documental else '7')),
+        'max_roi_long_side': 520 if wants_heavy else 420 if wants_documental else 320,
+    }
+
+
+def _reconstruct_structural_gaps(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
+    directives = directives or {}
+    work = binary.copy()
+    horiz = cv2.getStructuringElement(cv2.MORPH_RECT, (17 if directives.get('reconstruct_perimeters') else 11, 1))
+    vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 17 if directives.get('reconstruct_perimeters') else 11))
+    diag = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    h_closed = cv2.morphologyEx(work, cv2.MORPH_CLOSE, horiz, iterations=1)
+    v_closed = cv2.morphologyEx(work, cv2.MORPH_CLOSE, vert, iterations=1)
+    d_closed = cv2.morphologyEx(work, cv2.MORPH_CLOSE, diag, iterations=1)
+    merged = cv2.bitwise_or(work, h_closed)
+    merged = cv2.bitwise_or(merged, v_closed)
+    merged = cv2.bitwise_or(merged, d_closed)
+    return merged
+
+
 def _restore_region_from_gray(base_gray: np.ndarray, original_gray: np.ndarray, box: dict[str, int], pad: int = 10) -> np.ndarray:
     restored = base_gray.copy()
     h, w = restored.shape[:2]
@@ -197,7 +226,9 @@ def _warp_document(image: np.ndarray, corners: np.ndarray) -> tuple[np.ndarray, 
     return warped, matrix
 
 
-def _auto_upscale(image: np.ndarray, target_min_side: int = 1800) -> tuple[np.ndarray, bool, float]:
+def _auto_upscale(image: np.ndarray, target_min_side: int | None = None) -> tuple[np.ndarray, bool, float]:
+    if target_min_side is None:
+        target_min_side = int(os.getenv('TRAZOCAD_TARGET_MIN_SIDE', '1600'))
     h, w = image.shape[:2]
     min_side = min(h, w)
     if min_side >= target_min_side:
@@ -729,20 +760,21 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
             "h": int(h),
         })
 
-    # En Render Free el OCR global puede ser demasiado pesado.
-    # Para estabilizar el proceso, trabajamos solo por regiones y limitamos
-    # la cantidad de cajas según tamaño/área.
+    # Presupuesto OCR seguro: limitamos regiones, píxeles y tiempo para evitar
+    # que el motor textual tumbe el proceso en servicios chicos.
     warnings: list[str] = []
     texts: list[dict[str, Any]] = []
     boxes = list(candidate_regions)
-    max_boxes = 80 if directives.get('prioritize_dimensions') or directives.get('preserve_title_block') else 60
+    budgets = _ocr_budgets(directives)
+    max_boxes = int(budgets['max_boxes'])
     if len(boxes) > max_boxes:
         warnings.append(f"OCR reducido: se analizaron {max_boxes} regiones prioritarias de {len(boxes)} detectadas para evitar sobrecarga del servidor.")
         boxes = boxes[:max_boxes]
 
     total_pixels = image_bgr.shape[0] * image_bgr.shape[1]
     analyzed_pixels = 0
-    pixel_budget = int(total_pixels * (0.40 if directives.get('prioritize_dimensions') or directives.get('preserve_title_block') else 0.28))
+    pixel_budget = int(total_pixels * float(budgets['pixel_fraction']))
+    started_at = time.monotonic()
 
     for box in boxes:
         pad = 4
@@ -754,10 +786,18 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
         if roi.size == 0:
             continue
         roi_pixels = int(roi.shape[0] * roi.shape[1])
+        if time.monotonic() - started_at > float(budgets['time_budget_s']):
+            warnings.append('OCR reducido por presupuesto de tiempo para estabilizar el proceso.')
+            break
         if analyzed_pixels + roi_pixels > pixel_budget and analyzed_pixels > 0:
-            warnings.append("OCR reducido por presupuesto de cálculo: se priorizaron las regiones más grandes y legibles.")
+            warnings.append('OCR reducido por presupuesto de cálculo: se priorizaron las regiones más grandes y legibles.')
             break
         analyzed_pixels += roi_pixels
+        long_side = max(roi.shape[0], roi.shape[1])
+        max_roi_long_side = int(budgets['max_roi_long_side'])
+        if long_side > max_roi_long_side:
+            scale_down = max_roi_long_side / float(long_side)
+            roi = cv2.resize(roi, None, fx=scale_down, fy=scale_down, interpolation=cv2.INTER_AREA)
         scale = max(1.0, 56.0 / max(roi.shape[0], 1))
         if scale > 1.05:
             roi = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -804,7 +844,7 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
 
     deduped.sort(key=lambda item: (item["y"], item["x"]))
     warning = "; ".join(dict.fromkeys(warnings)) if warnings else None
-    return deduped, "RapidOCR por regiones estabilizado", warning
+    return deduped, "RapidOCR por regiones en modo seguro", warning
 
 def _classify_text_items(ocr_items: list[dict[str, Any]], image_shape: tuple[int, int, int]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     h, w = image_shape[:2]

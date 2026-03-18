@@ -80,6 +80,7 @@ let pollHandle = null;
 let pollFailureCount = 0;
 let isBusy = false;
 let pollingStartedAt = null;
+let autoRetryCount = 0;
 
 const ACTION_GROUPS = {
   dxf: [
@@ -149,6 +150,7 @@ function persistCurrentJob(jobId) {
     window.localStorage.setItem(CURRENT_JOB_STORAGE_KEY, currentJobId);
   } else {
     window.localStorage.removeItem(CURRENT_JOB_STORAGE_KEY);
+    autoRetryCount = 0;
   }
 }
 
@@ -216,7 +218,7 @@ function updateStatus(payload) {
       : state === 'recovering'
         ? 'El servidor está reconstruyendo el estado de la tarea. No cierres esta pestaña.'
         : state === 'missing'
-          ? 'La tarea se interrumpió y ya no quedó disponible en el servidor. Conviene volver a procesar el archivo.'
+          ? 'La tarea se interrumpió en el servidor. TrazoCad va a intentar reanudarla automáticamente si todavía existe una copia recuperable del archivo.'
           : 'Procesando el archivo en segundo plano.';
   stageLabel.textContent = `Etapa: ${stage.replaceAll('_', ' ')}`;
   jobLabel.textContent = `Job: ${payload?.job_id || '—'}`;
@@ -257,6 +259,24 @@ async function fetchVersion() {
   }
 }
 
+
+async function tryAutoRetry(jobId) {
+  if (!jobId || autoRetryCount >= 1) return false;
+  autoRetryCount += 1;
+  statusMessage.textContent = 'La tarea se interrumpió. Intentando relanzarla automáticamente…';
+  statusDetail.textContent = 'No cierres esta pestaña. TrazoCad está intentando recuperar el archivo original y relanzar el proceso.';
+  clearError();
+  try {
+    const payload = await fetchJson(`/api/process/${jobId}/retry`, { method: 'POST' });
+    updateStatus(payload);
+    scheduleNextPoll(1500);
+    return true;
+  } catch (error) {
+    showError(error.message || 'No se pudo relanzar automáticamente la tarea.');
+    return false;
+  }
+}
+
 function scheduleNextPoll(delay = POLL_INTERVAL_MS) {
   stopPolling();
   if (!currentJobId) return;
@@ -280,11 +300,23 @@ async function pollStatus(jobId) {
       return;
     }
 
-    if (payload.state === 'error' || payload.state === 'missing') {
+    if (payload.state === 'missing') {
+      const resumed = await tryAutoRetry(payload.job_id || currentJobId);
+      if (!resumed) {
+        stopPolling();
+        setBusy(false);
+        resetResults();
+        showError(payload.error || 'La tarea se interrumpió y no se pudo relanzar automáticamente.');
+        persistCurrentJob(null);
+      }
+      return;
+    }
+
+    if (payload.state === 'error') {
       stopPolling();
       setBusy(false);
       resetResults();
-      showError(payload.error || (payload.state === 'missing' ? 'La tarea se perdió durante el proceso.' : 'La tarea terminó con error.'));
+      showError(payload.error || 'La tarea terminó con error.');
       persistCurrentJob(null);
       return;
     }
@@ -315,6 +347,7 @@ async function restoreJobIfNeeded() {
 
   persistCurrentJob(storedJobId);
   pollingStartedAt = Date.now();
+  autoRetryCount = 0;
   setBusy(true);
   statusMessage.textContent = 'Recuperando tarea previa…';
   statusDetail.textContent = 'Se encontró una tarea anterior y se está consultando su estado.';
@@ -344,6 +377,7 @@ form.addEventListener('submit', async (event) => {
   setBusy(true);
   setProgress(2);
   pollingStartedAt = Date.now();
+  autoRetryCount = 0;
   statusMessage.textContent = 'Enviando el archivo al servidor…';
   statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano.';
   stageLabel.textContent = 'Etapa: cola';
