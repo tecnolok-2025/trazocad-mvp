@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.swp
+.env
+.venv/
+venv/
+.coverage
+.pytest_cache/
+.DS_Store
+Thumbs.db
+
+# runtime data
+data/uploads/*
+data/outputs/*
+!data/uploads/.gitkeep
+!data/outputs/.gitkeep

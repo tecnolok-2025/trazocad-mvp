@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TrazoCad v61 | Release profesional</title>
+    <meta
+      name="description"
+      content="TrazoCad by TLK digitaliza croquis y planos escaneados para generar DXF, PDF, JPG y PNG con una interfaz profesional y simple."
+    />
+    <link rel="icon" type="image/png" href="/static/assets/favicon.png" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero-card">
+        <div class="brand-row">
+          <img src="/static/assets/tlk-logo.png" alt="Tecno Logisti-K SA" class="brand-logo" />
+          <div>
+            <p class="eyebrow">TrazoCad by TLK</p>
+            <h1>TrazoCad v61</h1>
+            <p class="hero-subtitle">Digitalización técnica de planos a DXF y PDF con salida profesional simple.</p>
+          </div>
+        </div>
+        <div class="hero-links">
+          <a href="/manual" target="_blank" rel="noopener noreferrer">Manual de uso</a>
+          <span id="versionBadge">Versión 6.1.0</span>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Procesar archivo</h2>
+            <p>Subí una imagen, elegí el criterio básico y generá salidas técnicas limpias.</p>
+          </div>
+          <span class="section-tag">Flujo principal</span>
+        </div>
+
+        <form id="uploadForm" novalidate>
+          <label class="field field-file">
+            <span>Archivo</span>
+            <input id="fileInput" type="file" name="file" accept=".png,.jpg,.jpeg,.bmp,.tif,.tiff" required />
+            <small id="fileHelp">Formatos compatibles: PNG, JPG, BMP y TIFF. Límite recomendado: 25 MB.</small>
+          </label>
+
+          <div class="grid-3">
+            <label class="field">
+              <span>Tipo de dibujo</span>
+              <select name="drawing_type">
+                <option value="arquitectura">Arquitectura</option>
+                <option value="mecanico">Mecánico</option>
+                <option value="electrico">Eléctrico</option>
+                <option value="civil">Civil</option>
+                <option value="layout industrial">Layout industrial</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Tamaño de hoja</span>
+              <select name="sheet_size">
+                <option value="A4">A4</option>
+                <option value="A3" selected>A3</option>
+                <option value="A2">A2</option>
+                <option value="A1">A1</option>
+              </select>
+            </label>
+
+            <label class="field">
+              <span>Orientación de hoja</span>
+              <select name="sheet_orientation">
+                <option value="AUTO" selected>Automática</option>
+                <option value="HORIZONTAL">Apaisada</option>
+                <option value="VERTICAL">Vertical</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Notas opcionales</span>
+            <textarea name="notes" rows="4" placeholder="Ej: respetar orientación original, priorizar perímetro exterior, conservar ejes principales"></textarea>
+          </label>
+
+          <div class="form-actions">
+            <button id="submitButton" type="submit">Procesar</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="card" id="statusCard" aria-live="polite">
+        <div class="section-head">
+          <div>
+            <h2>Estado del proceso</h2>
+            <p id="statusMessage">Listo para procesar.</p>
+          </div>
+          <span class="progress-pill" id="progressPercent">0%</span>
+        </div>
+
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="progressFill" class="progress-fill"></div>
+        </div>
+
+        <div class="status-meta">
+          <span id="stageLabel">Sin tarea en ejecución</span>
+          <span id="jobLabel">Job: —</span>
+          <span id="timeLabel">Tiempo: —</span>
+        </div>
+
+        <p id="statusDetail" class="status-detail">Cuando inicies un proceso, acá vas a ver el avance y el resultado final.</p>
+        <p id="errorBox" class="error-box hidden"></p>
+      </section>
+
+      <section class="card hidden" id="resultsCard">
+        <div class="section-head">
+          <div>
+            <h2>Resultados</h2>
+            <p>Acciones directas sobre los archivos generados.</p>
+          </div>
+          <span class="section-tag">Entrega</span>
+        </div>
+
+        <div class="summary-strip" id="summaryStrip"></div>
+
+        <div class="results-grid">
+          <div class="result-group">
+            <h3>DXF</h3>
+            <div class="actions-list" id="dxfActions"></div>
+          </div>
+          <div class="result-group">
+            <h3>PDF</h3>
+            <div class="actions-list" id="pdfActions"></div>
+          </div>
+          <div class="result-group">
+            <h3>Imágenes</h3>
+            <div class="actions-list" id="imageActions"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
