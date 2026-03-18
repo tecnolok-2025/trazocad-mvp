@@ -215,7 +215,9 @@ function updateStatus(payload) {
       ? 'La tarea terminó con error. Revisá el mensaje mostrado arriba.'
       : state === 'recovering'
         ? 'El servidor está reconstruyendo el estado de la tarea. No cierres esta pestaña.'
-        : 'Procesando el archivo en segundo plano.';
+        : state === 'missing'
+          ? 'La tarea se interrumpió y ya no quedó disponible en el servidor. Conviene volver a procesar el archivo.'
+          : 'Procesando el archivo en segundo plano.';
   stageLabel.textContent = `Etapa: ${stage.replaceAll('_', ' ')}`;
   jobLabel.textContent = `Job: ${payload?.job_id || '—'}`;
   const elapsed = payload?.elapsed_seconds || (pollingStartedAt ? (Date.now() - pollingStartedAt) / 1000 : 0);
@@ -278,17 +280,17 @@ async function pollStatus(jobId) {
       return;
     }
 
-    if (payload.state === 'error') {
+    if (payload.state === 'error' || payload.state === 'missing') {
       stopPolling();
       setBusy(false);
       resetResults();
-      showError(payload.error || 'La tarea terminó con error.');
+      showError(payload.error || (payload.state === 'missing' ? 'La tarea se perdió durante el proceso.' : 'La tarea terminó con error.'));
       persistCurrentJob(null);
       return;
     }
 
     setBusy(true);
-    scheduleNextPoll();
+    scheduleNextPoll(payload.state === 'recovering' ? POLL_INTERVAL_MS + 2000 : POLL_INTERVAL_MS);
   } catch (error) {
     pollFailureCount += 1;
     if (pollFailureCount >= 2) {
@@ -376,5 +378,16 @@ fileInput.addEventListener('change', () => {
 fetchVersion();
 restoreJobIfNeeded();
 
-if (noteTheme) noteTheme.addEventListener('change', refreshNoteActions);
+
+function syncNotesUi() {
+  composeNotes();
+}
+
+if (noteTheme) noteTheme.addEventListener('change', () => {
+  refreshNoteActions();
+  syncNotesUi();
+});
+if (noteAction) noteAction.addEventListener('change', syncNotesUi);
+if (notesFree) notesFree.addEventListener('input', syncNotesUi);
 refreshNoteActions();
+syncNotesUi();

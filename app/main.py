@@ -27,7 +27,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '66.0.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '67.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,7 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'ocr dirigido y reconstrucción documental',
+        'linea': 'recuperación robusta y directivas documental',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),
@@ -202,6 +202,43 @@ def _elapsed_fields(job: dict) -> dict[str, float]:
     }
 
 
+def _job_meta_payload(upload_path: Path, output_dir: Path, file_name: str, sheet_size: str, drawing_type: str, sheet_orientation: str, notes: str) -> dict[str, str]:
+    return {
+        'upload_path': str(upload_path),
+        'output_dir': str(output_dir),
+        'file_name': file_name,
+        'sheet_size': sheet_size,
+        'drawing_type': drawing_type,
+        'sheet_orientation': sheet_orientation,
+        'notes': notes,
+    }
+
+
+def _resume_job_if_possible(job_id: str, job: dict) -> bool:
+    if job.get('state') in {'done', 'error'}:
+        return False
+    meta = job.get('meta') or {}
+    upload_raw = meta.get('upload_path')
+    if not upload_raw:
+        return False
+    upload_path = Path(upload_raw)
+    if not upload_path.exists():
+        return False
+    with job_lock:
+        current = job_store.get(job_id)
+        if current and current.get('state') in {'queued', 'running'}:
+            return True
+        resumed = dict(job)
+        resumed['state'] = 'running'
+        resumed['stage'] = job.get('stage') or 'cola'
+        resumed['message'] = 'El servidor retomó la tarea después de una interrupción temporal.'
+        resumed['updated_at'] = time.time()
+        job_store[job_id] = resumed
+    persistence.save_job(resumed)
+    executor.submit(_start_job, job_id, meta)
+    return True
+
+
 def _set_job_stage(job_id: str, stage: str, extra: dict | None = None) -> None:
     stage_meta = STAGE_MAP.get(stage, {'percent': 0, 'detail': stage.replace('_', ' ')})
     snapshot = None
@@ -213,6 +250,8 @@ def _set_job_stage(job_id: str, stage: str, extra: dict | None = None) -> None:
         job['progress'] = stage_meta['percent']
         job['message'] = stage_meta['detail']
         job['updated_at'] = time.time()
+        if stage not in {'cola', 'completado', 'error'}:
+            job['state'] = 'running'
         if extra:
             job.update(extra)
         snapshot = dict(job)
@@ -393,7 +432,7 @@ def infra() -> JSONResponse:
                 'servicio': os.getenv('RENDER_SERVICE_NAME', 'local'),
                 'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
                 'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
-                'nota': 'La release privilegia estabilidad y puede usar SQLite local como fallback si PostgreSQL/Neon no responde.',
+                'nota': 'La release privilegia estabilidad y usa PostgreSQL/Neon cuando está disponible y mantiene un espejo local SQLite para recuperar estado ante reinicios o fallos transitorios.',
             },
             'persistencia': persistence.stats(),
             'alcance': 'Release de OCR dirigido y reconstrucción documental: presentación más fiel del plano, OCR por regiones, mejor preservación de rótulos/textos y DXF nube de puntos con base raster fiel.',
@@ -469,6 +508,15 @@ async def process_file(
         'progress': STAGE_MAP['cola']['percent'],
         'message': STAGE_MAP['cola']['detail'],
         'file_name': filename or upload_path.name,
+        'meta': _job_meta_payload(
+            upload_path=upload_path,
+            output_dir=output_dir,
+            file_name=filename or upload_path.name,
+            sheet_size=normalized_sheet_size,
+            drawing_type=normalized_drawing_type,
+            sheet_orientation=normalized_orientation,
+            notes=normalized_notes,
+        ),
         'result': None,
         'error': None,
         'created_at': time.time(),
@@ -478,18 +526,7 @@ async def process_file(
         job_store[job_id] = initial_job
     persistence.save_job(initial_job)
 
-    executor.submit(
-        _start_job,
-        job_id,
-        {
-            'upload_path': upload_path,
-            'file_name': filename or upload_path.name,
-            'sheet_size': normalized_sheet_size,
-            'drawing_type': normalized_drawing_type,
-            'sheet_orientation': normalized_orientation,
-            'notes': normalized_notes,
-        },
-    )
+    executor.submit(_start_job, job_id, dict(initial_job['meta']))
     return JSONResponse(
         {
             'job_id': job_id,
@@ -533,11 +570,28 @@ def process_status(job_id: str) -> JSONResponse:
                         'warning': 'Recuperación de estado en progreso.',
                     }
                 )
-            raise HTTPException(status_code=404, detail='No se encontró la tarea solicitada.')
+            return JSONResponse(
+                {
+                    'job_id': job_id,
+                    'state': 'missing',
+                    'stage': 'interrumpida',
+                    'progress': 0,
+                    'message': 'El servidor perdió el estado de la tarea antes de completarla. Esto suele pasar por un reinicio del proceso o una caída transitoria de persistencia.',
+                    'version': APP_VERSION,
+                    'updated_at': time.time(),
+                    'error': 'La tarea ya no está disponible para continuar en este servidor.',
+                }
+            )
     elif job.get('state') == 'done' and not job.get('result'):
         recovered = _recover_done_payload(job_id, job=job)
         if recovered:
             job = recovered
+
+    if job and job.get('state') in {'queued', 'running'} and job_id not in job_store:
+        if _resume_job_if_possible(job_id, job):
+            job = persistence.load_job(job_id) or job
+            job['state'] = 'running'
+            job['message'] = 'El servidor retomó la tarea después de una interrupción temporal.'
 
     payload = {
         'job_id': job_id,
@@ -553,6 +607,8 @@ def process_status(job_id: str) -> JSONResponse:
         payload['result'] = job.get('result')
     if job.get('state') == 'error':
         payload['error'] = job.get('error') or 'Ocurrió un error inesperado.'
+    if job.get('state') == 'missing':
+        payload['error'] = job.get('error') or 'La tarea ya no está disponible para continuar en este servidor.'
     return JSONResponse(payload)
 
 

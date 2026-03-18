@@ -1,4 +1,4 @@
-# TrazoCad v66
+# TrazoCad v67
 
 TrazoCad es una aplicación de Tecno Logisti-K SA para digitalizar croquis, fotos o planos escaneados y generar DXF, PDF, JPG y PNG.
 

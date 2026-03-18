@@ -112,6 +112,34 @@ def _resize_for_report(image: np.ndarray, max_width: int = 1600) -> np.ndarray:
     return cv2.resize(image, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
 
 
+def _parse_user_directives(notes: str) -> dict[str, bool]:
+    text = (notes or '').lower()
+    return {
+        'prioritize_fidelity': any(token in text for token in ['fidelidad', 'preservar plano completo', 'preservar el plano', 'priorizar fidelidad visual']),
+        'preserve_title_block': any(token in text for token in ['rotulo', 'rótulo', 'referencias', 'cuadro de plano']),
+        'prioritize_dimensions': any(token in text for token in ['cota', 'cotas', 'ejes', 'texto técnico', 'textos técnicos']),
+        'reconstruct_perimeters': any(token in text for token in ['reconstruir perímetros', 'reconstruir perimetros', 'arcos', 'contornos', 'cerrar cortes']),
+        'preserve_dashed': any(token in text for token in ['puntead', 'trazo fino', 'trazos finos', 'líneas de cota', 'lineas de cota']),
+    }
+
+
+def _blend_min(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return cv2.min(a, b)
+
+
+def _restore_region_from_gray(base_gray: np.ndarray, original_gray: np.ndarray, box: dict[str, int], pad: int = 10) -> np.ndarray:
+    restored = base_gray.copy()
+    h, w = restored.shape[:2]
+    x1 = max(0, int(box['x']) - pad)
+    y1 = max(0, int(box['y']) - pad)
+    x2 = min(w, int(box['x'] + box['w']) + pad)
+    y2 = min(h, int(box['y'] + box['h']) + pad)
+    if x2 <= x1 or y2 <= y1:
+        return restored
+    restored[y1:y2, x1:x2] = _blend_min(restored[y1:y2, x1:x2], original_gray[y1:y2, x1:x2])
+    return restored
+
+
 def _order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -210,7 +238,8 @@ def _build_binary(gray: np.ndarray) -> np.ndarray:
     return binary
 
 
-def _repair_broken_traces(binary: np.ndarray) -> np.ndarray:
+def _repair_broken_traces(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
+    directives = directives or {}
     repaired = binary.copy()
     kernels = [
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
@@ -219,6 +248,17 @@ def _repair_broken_traces(binary: np.ndarray) -> np.ndarray:
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
         cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
     ]
+    if directives.get('reconstruct_perimeters'):
+        kernels.extend([
+            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 9)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        ])
+    if directives.get('preserve_dashed'):
+        kernels.extend([
+            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 11)),
+        ])
     diag1 = np.eye(5, dtype=np.uint8)
     diag2 = np.fliplr(diag1)
     for kernel in kernels + [diag1, diag2]:
@@ -227,14 +267,15 @@ def _repair_broken_traces(binary: np.ndarray) -> np.ndarray:
     return repaired
 
 
-def _reinforce_title_block(binary: np.ndarray) -> np.ndarray:
+def _reinforce_title_block(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
+    directives = directives or {}
     h, w = binary.shape[:2]
-    y1, x1 = int(h * 0.68), int(w * 0.66)
+    y1, x1 = int(h * (0.64 if directives.get('preserve_title_block') else 0.68)), int(w * (0.62 if directives.get('preserve_title_block') else 0.66))
     roi = binary[y1:h, x1:w].copy()
     if roi.size == 0:
         return binary
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, roi.shape[1] // 28), 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, roi.shape[0] // 18)))
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, roi.shape[1] // (22 if directives.get('preserve_title_block') else 28)), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, roi.shape[0] // (14 if directives.get('preserve_title_block') else 18))))
     roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, h_kernel, iterations=1)
     roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, v_kernel, iterations=1)
     out = binary.copy()
@@ -621,13 +662,19 @@ def _preparar_region_ocr(roi_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(binaria, cv2.COLOR_GRAY2BGR)
 
 
-def _collect_priority_ocr_regions(text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, image_shape: tuple[int, int, int]) -> list[dict[str, int]]:
+def _collect_priority_ocr_regions(text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, image_shape: tuple[int, int, int], directives: dict[str, bool] | None = None) -> list[dict[str, int]]:
+    directives = directives or {}
     h, w = image_shape[:2]
     regions = [dict(box) for box in text_boxes]
     title_blocks = _detect_title_block(graphics_binary)
     regions.extend(title_blocks)
     regions.append({'x': int(w * 0.62), 'y': int(h * 0.67), 'w': int(w * 0.34), 'h': int(h * 0.26)})
     regions.append({'x': int(w * 0.30), 'y': int(h * 0.84), 'w': int(w * 0.32), 'h': int(h * 0.10)})
+    if directives.get('preserve_title_block'):
+        regions.append({'x': int(w * 0.58), 'y': int(h * 0.62), 'w': int(w * 0.40), 'h': int(h * 0.34)})
+    if directives.get('prioritize_dimensions'):
+        regions.append({'x': int(w * 0.08), 'y': int(h * 0.02), 'w': int(w * 0.84), 'h': int(h * 0.18)})
+        regions.append({'x': int(w * 0.05), 'y': int(h * 0.78), 'w': int(w * 0.75), 'h': int(h * 0.16)})
     deduped: list[dict[str, int]] = []
     for item in regions:
         if item['w'] <= 0 or item['h'] <= 0:
@@ -651,8 +698,9 @@ def _collect_priority_ocr_regions(text_boxes: list[dict[str, int]], graphics_bin
     return deduped
 
 
-def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_binary: np.ndarray) -> tuple[list[dict[str, Any]], str, str | None]:
-    candidate_regions = _collect_priority_ocr_regions(text_boxes, graphics_binary, image_bgr.shape)
+def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, directives: dict[str, bool] | None = None) -> tuple[list[dict[str, Any]], str, str | None]:
+    directives = directives or {}
+    candidate_regions = _collect_priority_ocr_regions(text_boxes, graphics_binary, image_bgr.shape, directives)
     if not candidate_regions:
         return [], "sin zonas de texto", None
     try:
@@ -687,14 +735,14 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
     warnings: list[str] = []
     texts: list[dict[str, Any]] = []
     boxes = list(candidate_regions)
-    max_boxes = 60
+    max_boxes = 80 if directives.get('prioritize_dimensions') or directives.get('preserve_title_block') else 60
     if len(boxes) > max_boxes:
         warnings.append(f"OCR reducido: se analizaron {max_boxes} regiones prioritarias de {len(boxes)} detectadas para evitar sobrecarga del servidor.")
         boxes = boxes[:max_boxes]
 
     total_pixels = image_bgr.shape[0] * image_bgr.shape[1]
     analyzed_pixels = 0
-    pixel_budget = int(total_pixels * 0.28)
+    pixel_budget = int(total_pixels * (0.40 if directives.get('prioritize_dimensions') or directives.get('preserve_title_block') else 0.28))
 
     for box in boxes:
         pad = 4
@@ -1067,14 +1115,25 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
         cv2.rectangle(clean, (item["x"], item["y"]), (item["x"] + item["w"], item["y"] + item["h"]), (170, 170, 220), 1)
     return clean
 
-def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray) -> np.ndarray:
+def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None) -> np.ndarray:
     base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
     soft = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
     soft = cv2.medianBlur(soft, 3)
     recovered = cv2.bitwise_or(cv2.bitwise_not(soft), repaired_binary)
     recovered = cv2.bitwise_or(recovered, binary)
+    directives = directives or {}
+    title_blocks = title_blocks or []
     presentation_gray = cv2.bitwise_not(recovered)
     presentation_gray = cv2.normalize(presentation_gray, None, 0, 255, cv2.NORM_MINMAX)
+    original_gray = cv2.normalize(normalized_gray, None, 0, 255, cv2.NORM_MINMAX)
+    if directives.get('prioritize_fidelity') or directives.get('preserve_dashed'):
+        presentation_gray = _blend_min(presentation_gray, original_gray)
+    for box in title_blocks:
+        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, box, pad=18 if directives.get('preserve_title_block') else 10)
+    if directives.get('preserve_title_block'):
+        h, w = presentation_gray.shape[:2]
+        title_guess = {'x': int(w * 0.58), 'y': int(h * 0.62), 'w': int(w * 0.40), 'h': int(h * 0.34)}
+        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=12)
     return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
 
 
@@ -1268,6 +1327,7 @@ def process_drawing(
     calibration: dict[str, Any] | None = None,
     progress_callback: Any | None = None,
 ) -> PipelineResult:
+    directives = _parse_user_directives(notes)
     if progress_callback:
         progress_callback("preparando_archivo")
     image = _read_image(input_path)
@@ -1283,8 +1343,8 @@ def process_drawing(
     image, auto_upscaled, upscale_factor = _auto_upscale(image)
     reconstructed_gray, normalized_gray, enhanced_bgr = _enhance_image(image)
     binary = _build_binary(reconstructed_gray)
-    repaired_binary = _repair_broken_traces(binary)
-    repaired_binary = _reinforce_title_block(repaired_binary)
+    repaired_binary = _repair_broken_traces(binary, directives)
+    repaired_binary = _reinforce_title_block(repaired_binary, directives)
     if progress_callback:
         progress_callback("separando_texto_y_dibujo")
     text_boxes, text_mask = _detect_text_regions(repaired_binary)
@@ -1293,7 +1353,7 @@ def process_drawing(
 
     if progress_callback:
         progress_callback("reconociendo_texto")
-    ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary)
+    ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives)
     cota_texts, rotulo_texts, general_texts = _classify_text_items(ocr_items, image.shape)
     if progress_callback:
         progress_callback("vectorizando_geometria")
@@ -1385,7 +1445,7 @@ def process_drawing(
     reconstruction_preview = enhanced_bgr.copy()
     analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
     vector_base = _build_vector_base(graphics_binary, ocr_items)
-    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary, repaired_binary)
+    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary, repaired_binary, geometry.get("title_blocks", []), directives)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"
@@ -1414,6 +1474,7 @@ def process_drawing(
         f"Bloques CAD sugeridos: {len(geometry.get('symbol_blocks', []))}. Tipos preliminares detectados: {len({item.get('nombre', '') for item in geometry.get('symbol_blocks', []) if item.get('nombre')})}.",
         f"Reglas de disciplina aplicadas: {len(geometry.get('discipline_rules', []))}.",
         f"Observaciones del usuario: {notes.strip() or 'sin notas adicionales'}.",
+        f"Directivas activas: {', '.join([k for k, v in directives.items() if v]) or 'ninguna'}.",
         "La salida sigue siendo una reconstrucción asistida y debe validarse antes de utilizarse como documentación definitiva.",
     ]
     warnings = _warnings(reference_mode, quality_metrics, geometry, quality_band, calibration, ocr_warning)

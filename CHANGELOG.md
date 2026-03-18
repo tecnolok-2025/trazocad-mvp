@@ -1,4 +1,4 @@
-## 66.0.0
+## 67.0.0
 - OCR dirigido por regiones
 - mejora de reconstrucción raster para cerrar trazos débiles
 - PDF con mayor aprovechamiento de hoja
