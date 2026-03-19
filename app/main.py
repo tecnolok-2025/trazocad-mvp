@@ -18,10 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.services.dxf_exporter import export_to_dxf, export_to_point_cloud_dxf
-from app.services.image_pipeline import process_drawing
 from app.services.persistence import persistence
-from app.services.report_generator import build_report_pdf
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / 'data'
@@ -29,7 +26,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '69.0.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '69.1.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,7 +50,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release de continuidad duradera y reconstrucción estructural base: reintento robusto de tareas, OCR seguro por presupuesto y mejor cierre de trazos.',
+    description='TrazoCad release 69.1 de arranque blindado para Render: health check explícito, persistencia lazy y servicios pesados diferidos hasta el procesamiento.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -82,7 +79,7 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'recuperación robusta y directivas documental',
+        'linea': 'arranque blindado y health check explícito',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),
@@ -313,6 +310,9 @@ def _export_raster_variants(source_png: Path, jpg_path: Path, png_path: Path) ->
 
 
 def _build_result_payload(job_id: str, file_name: str, sheet_size: str, drawing_type: str, result: dict) -> dict:
+    from app.services.dxf_exporter import export_to_dxf, export_to_point_cloud_dxf
+    from app.services.report_generator import build_report_pdf
+
     output_dir = _job_output_dir(job_id)
     cleaned_source = _preferred_clean_image(result)
 
@@ -384,6 +384,8 @@ def _start_job(job_id: str, payload: dict) -> None:
             _set_job_stage(job_id, stage, extra)
 
         progress('preparando_archivo')
+        from app.services.image_pipeline import process_drawing
+
         pipeline_result = process_drawing(
             input_path=upload_path,
             output_dir=_job_output_dir(job_id),
@@ -481,7 +483,7 @@ def infra() -> JSONResponse:
                 'nota': 'La release privilegia estabilidad y usa PostgreSQL/Neon cuando está disponible y mantiene un espejo local SQLite para recuperar estado ante reinicios o fallos transitorios.',
             },
             'persistencia': persistence.stats(),
-            'alcance': 'Release de OCR dirigido y reconstrucción documental: presentación más fiel del plano, OCR por regiones, mejor preservación de rótulos/textos y DXF nube de puntos con base raster fiel.',
+            'alcance': 'Release 69.1 de arranque blindado: health check liviano, persistencia lazy, imports pesados diferidos y continuidad de procesamiento sin cargar el startup.',
         }
     )
 

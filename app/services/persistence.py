@@ -22,12 +22,13 @@ SQLITE_PATH = DATA_DIR / "trazocad_local.db"
 class Persistence:
     def __init__(self) -> None:
         self.database_url = os.getenv("DATABASE_URL", "").strip()
-        self.provider = "memoria"
-        self.enabled = False
-        self.detail = "Sin persistencia externa. Solo memoria y archivos locales."
+        self.provider = "sqlite"
+        self.enabled = True
+        self.detail = "Persistencia local SQLite pendiente de inicialización."
         self._sqlite_path = SQLITE_PATH
         self._runtime_warning: str | None = None
-        self._init_provider()
+        self._initialized = False
+        self._postgres_ready = False
 
     def _normalize_database_url(self, url: str) -> str:
         url = url.strip()
@@ -54,11 +55,11 @@ class Persistence:
         last_exc = None
         for _ in range(2):
             try:
-                conn = psycopg.connect(self.database_url, connect_timeout=5)
+                conn = psycopg.connect(self.database_url, connect_timeout=4)
                 break
             except Exception as exc:  # pragma: no cover - depende del entorno
                 last_exc = exc
-                time.sleep(0.35)
+                time.sleep(0.25)
         else:
             raise RuntimeError(f"PostgreSQL/Neon no respondió: {last_exc}")
         try:
@@ -67,8 +68,32 @@ class Persistence:
         finally:
             conn.close()
 
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        self._init_sqlite()
+        self.provider = "sqlite"
+        self.enabled = True
+        self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}."
+        db_url = self.database_url.strip()
+        if db_url and db_url.startswith(("postgres://", "postgresql://")) and psycopg is not None:
+            self.database_url = self._normalize_database_url(db_url)
+            try:
+                self._init_postgres()
+                self.provider = "postgres"
+                self._postgres_ready = True
+                self.detail = "Persistencia principal en PostgreSQL/Neon con espejo local SQLite para recuperación de estado."
+                self._runtime_warning = None
+            except Exception as exc:
+                self.provider = "sqlite"
+                self._postgres_ready = False
+                self._runtime_warning = f"PostgreSQL/Neon no quedó listo al inicializar: {exc}"
+                self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}. PostgreSQL/Neon quedó en modo diferido."
+        self._initialized = True
+
     @contextmanager
     def connect(self, target: str = "auto"):
+        self._ensure_initialized()
         selected = self.provider if target == "auto" else target
         if selected == "postgres":
             with self._connect_postgres() as conn:
@@ -76,25 +101,6 @@ class Persistence:
         else:
             with self._connect_sqlite() as conn:
                 yield conn
-
-    def _init_provider(self) -> None:
-        self._init_sqlite()
-        if self.database_url and self.database_url.startswith(("postgres://", "postgresql://")) and psycopg is not None:
-            self.database_url = self._normalize_database_url(self.database_url)
-            try:
-                self._init_postgres()
-                self.provider = "postgres"
-                self.enabled = True
-                self.detail = "Persistencia principal en PostgreSQL/Neon con espejo local SQLite para recuperación de estado."
-                return
-            except Exception as exc:
-                self.provider = "sqlite"
-                self.enabled = True
-                self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}. Motivo: falló PostgreSQL/Neon al iniciar: {exc}"
-                return
-        self.provider = "sqlite"
-        self.enabled = True
-        self.detail = f"Persistencia local SQLite habilitada en {self._sqlite_path.name}."
 
     def _ensure_sqlite_columns(self) -> None:
         with self._connect_sqlite() as conn:
@@ -228,9 +234,9 @@ class Persistence:
             )
 
     def save_job(self, data: dict[str, Any]) -> None:
-        # Siempre espejamos a SQLite local para recuperación rápida tras reinicios del proceso.
+        self._ensure_initialized()
         self._save_job_sqlite(data)
-        if self.provider == "postgres":
+        if self._postgres_ready:
             try:
                 self._save_job_postgres(data)
                 self._runtime_warning = None
@@ -257,8 +263,9 @@ class Persistence:
         }
 
     def load_job(self, job_id: str) -> dict[str, Any] | None:
+        self._ensure_initialized()
         row = None
-        if self.provider == "postgres":
+        if self._postgres_ready:
             try:
                 with self._connect_postgres() as conn:
                     row = conn.execute(
@@ -277,6 +284,7 @@ class Persistence:
         return self._row_to_job(row)
 
     def save_revision(self, job_id: str, payload: dict[str, Any]) -> None:
+        self._ensure_initialized()
         raw = json.dumps(payload, ensure_ascii=False)
         now = time.time()
         with self._connect_sqlite() as conn:
@@ -288,7 +296,7 @@ class Persistence:
                 """,
                 (job_id, raw, now),
             )
-        if self.provider == "postgres":
+        if self._postgres_ready:
             try:
                 with self._connect_postgres() as conn:
                     conn.execute(
@@ -303,8 +311,9 @@ class Persistence:
                 self._runtime_warning = f"Persistencia principal degradada temporalmente: {exc}"
 
     def load_revision(self, job_id: str) -> dict[str, Any] | None:
+        self._ensure_initialized()
         row = None
-        if self.provider == "postgres":
+        if self._postgres_ready:
             try:
                 with self._connect_postgres() as conn:
                     row = conn.execute("SELECT payload_json FROM revision_states WHERE job_id=%s", (job_id,)).fetchone()
@@ -318,11 +327,12 @@ class Persistence:
         return json.loads(row[0])
 
     def stats(self) -> dict[str, Any]:
+        self._ensure_initialized()
         try:
             with self._connect_sqlite() as sqlite_conn:
                 sqlite_jobs = sqlite_conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0]
             postgres_jobs = None
-            if self.provider == "postgres":
+            if self._postgres_ready:
                 try:
                     with self._connect_postgres() as conn:
                         postgres_jobs = conn.execute("SELECT COUNT(*) FROM job_runs").fetchone()[0]
