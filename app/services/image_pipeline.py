@@ -117,12 +117,22 @@ def _resize_for_report(image: np.ndarray, max_width: int = 1600) -> np.ndarray:
 def _parse_user_directives(notes: str) -> dict[str, bool]:
     text = (notes or '').lower()
     return {
-        'prioritize_fidelity': any(token in text for token in ['fidelidad', 'preservar plano completo', 'preservar el plano', 'priorizar fidelidad visual']),
-        'preserve_title_block': any(token in text for token in ['rotulo', 'rótulo', 'referencias', 'cuadro de plano']),
-        'prioritize_dimensions': any(token in text for token in ['cota', 'cotas', 'ejes', 'texto técnico', 'textos técnicos']),
-        'reconstruct_perimeters': any(token in text for token in ['reconstruir perímetros', 'reconstruir perimetros', 'arcos', 'contornos', 'cerrar cortes']),
-        'preserve_dashed': any(token in text for token in ['puntead', 'trazo fino', 'trazos finos', 'líneas de cota', 'lineas de cota']),
+        'prioritize_fidelity': any(token in text for token in ['[fidelity]', 'fidelidad', 'preservar plano completo', 'preservar el plano', 'priorizar fidelidad visual']),
+        'preserve_title_block': any(token in text for token in ['[title]', 'rotulo', 'rótulo', 'referencias', 'cuadro de plano']),
+        'prioritize_dimensions': any(token in text for token in ['[dimensions]', 'cota', 'cotas', 'ejes', 'texto técnico', 'textos técnicos']),
+        'reconstruct_perimeters': any(token in text for token in ['[reconstruct]', '[geometry]', 'reconstruir perímetros', 'reconstruir perimetros', 'arcos', 'contornos', 'cerrar cortes']),
+        'preserve_dashed': any(token in text for token in ['[dashed]', 'puntead', 'trazo fino', 'trazos finos', 'líneas de cota', 'lineas de cota']),
+        'force_ocr': '[ocr]' in text,
+        'safe_mode': '[safe]' in text or '[ocr]' not in text,
     }
+
+
+def _should_run_ocr(directives: dict[str, bool] | None = None) -> bool:
+    directives = directives or {}
+    env_default = os.getenv('TRAZOCAD_ENABLE_OCR_BY_DEFAULT', '0').strip().lower() in {'1', 'true', 'yes', 'si'}
+    if directives.get('force_ocr'):
+        return True
+    return env_default
 
 
 def _blend_min(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -249,11 +259,11 @@ def _normalize_background(gray: np.ndarray) -> np.ndarray:
 def _enhance_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     normalized = _normalize_background(gray)
-    clahe = cv2.createCLAHE(clipLimit=2.7, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     contrast = clahe.apply(normalized)
-    denoised = cv2.fastNlMeansDenoising(contrast, None, 10, 7, 21)
-    gaussian = cv2.GaussianBlur(denoised, (0, 0), 1.2)
-    sharpened = cv2.addWeighted(denoised, 1.55, gaussian, -0.55, 0)
+    denoised = cv2.fastNlMeansDenoising(contrast, None, 6, 7, 21)
+    gaussian = cv2.GaussianBlur(denoised, (0, 0), 0.9)
+    sharpened = cv2.addWeighted(denoised, 1.18, gaussian, -0.18, 0)
     whitened = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     return sharpened, normalized, whitened
 
@@ -271,30 +281,30 @@ def _build_binary(gray: np.ndarray) -> np.ndarray:
 
 def _repair_broken_traces(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
     directives = directives or {}
+    # En v70 la reparación es conservadora por defecto para evitar empastado.
+    if not directives.get('reconstruct_perimeters') and not directives.get('preserve_dashed'):
+        return binary.copy()
     repaired = binary.copy()
     kernels = [
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
     ]
     if directives.get('reconstruct_perimeters'):
         kernels.extend([
-            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         ])
     if directives.get('preserve_dashed'):
         kernels.extend([
-            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
         ])
-    diag1 = np.eye(3, dtype=np.uint8)
-    diag2 = np.fliplr(diag1)
     before_fill = float(cv2.countNonZero(repaired)) / float(max(repaired.size, 1))
-    for kernel in kernels + [diag1, diag2]:
+    for kernel in kernels:
         candidate = cv2.morphologyEx(repaired, cv2.MORPH_CLOSE, kernel, iterations=1)
         candidate_fill = float(cv2.countNonZero(candidate)) / float(max(candidate.size, 1))
-        if candidate_fill <= min(0.22, before_fill + 0.025):
+        if candidate_fill <= min(0.18, before_fill + 0.012):
             repaired = candidate
             before_fill = candidate_fill
     repaired = cv2.bitwise_or(repaired, binary)
@@ -303,21 +313,15 @@ def _repair_broken_traces(binary: np.ndarray, directives: dict[str, bool] | None
 
 def _reinforce_title_block(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
     directives = directives or {}
+    # En v70 evitamos reforzar el rótulo con cierres agresivos: solo una limpieza mínima si se pidió explícitamente.
     if not directives.get('preserve_title_block'):
         return binary
     h, w = binary.shape[:2]
-    y1, x1 = int(h * 0.68), int(w * 0.66)
+    y1, x1 = int(h * 0.70), int(w * 0.68)
     roi = binary[y1:h, x1:w].copy()
     if roi.size == 0:
         return binary
-    base_fill = float(cv2.countNonZero(roi)) / float(max(roi.size, 1))
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(7, roi.shape[1] // 34), 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(7, roi.shape[0] // 24)))
-    candidate = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, h_kernel, iterations=1)
-    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, v_kernel, iterations=1)
-    candidate_fill = float(cv2.countNonZero(candidate)) / float(max(candidate.size, 1))
-    if candidate_fill > min(0.18, base_fill * 1.8 + 0.03):
-        return binary
+    candidate = cv2.morphologyEx(roi, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
     out = binary.copy()
     out[y1:h, x1:w] = cv2.bitwise_or(out[y1:h, x1:w], candidate)
     return out
@@ -1168,7 +1172,33 @@ def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndar
     directives = directives or {}
     title_blocks = title_blocks or []
     original_gray = cv2.normalize(normalized_gray, None, 0, 255, cv2.NORM_MINMAX)
-    presentation_gray = original_gray.copy()
+    base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Base suave y fiel, evitando una máscara dura tipo vectorizado.
+    presentation_gray = cv2.addWeighted(original_gray, 0.82, base_gray, 0.18, 0)
+
+    # Refuerzo leve de líneas, nunca agresivo.
+    if directives.get('reconstruct_perimeters') or directives.get('preserve_dashed'):
+        line_mask = cv2.bitwise_or(binary, cv2.bitwise_and(repaired_binary, cv2.bitwise_not(binary)))
+        line_mask = cv2.GaussianBlur(line_mask, (0, 0), 0.45)
+        line_mask_f = line_mask.astype(np.float32) / 255.0
+        presentation_gray = np.clip(presentation_gray.astype(np.float32) - line_mask_f * 10.0, 0, 255).astype(np.uint8)
+
+    # Si se prioriza fidelidad, se reinserta detalle fino del original sin endurecerlo.
+    if directives.get('prioritize_fidelity') or directives.get('preserve_title_block'):
+        detail = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 6)
+        detail = cv2.medianBlur(detail, 3)
+        presentation_gray = cv2.min(presentation_gray, cv2.addWeighted(detail, 0.18, original_gray, 0.82, 0))
+
+    # Restaurar el rótulo desde el gris original para que no se empaste ni se pierda.
+    for box in title_blocks:
+        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, box, pad=20 if directives.get('preserve_title_block') else 10)
+    if directives.get('preserve_title_block'):
+        h, w = presentation_gray.shape[:2]
+        title_guess = {'x': int(w * 0.62), 'y': int(h * 0.66), 'w': int(w * 0.34), 'h': int(h * 0.26)}
+        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=10)
+
+    return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
 
     base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
     detail = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
@@ -1419,7 +1449,10 @@ def process_drawing(
 
     if progress_callback:
         progress_callback("reconociendo_texto")
-    ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives)
+    if _should_run_ocr(directives):
+        ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives)
+    else:
+        ocr_items, ocr_engine, ocr_warning = [], "desactivado por estabilidad", "El OCR quedó desactivado en esta corrida para priorizar estabilidad en Render. Activá una acción OCR solo cuando realmente necesites recuperar textos."
     cota_texts, rotulo_texts, general_texts = _classify_text_items(ocr_items, image.shape)
     if progress_callback:
         progress_callback("vectorizando_geometria")

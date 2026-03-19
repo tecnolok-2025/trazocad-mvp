@@ -1,13 +1,10 @@
-## 69.1.0
-- Blindaje de arranque para Render con `healthCheckPath: /health`.
-- Persistencia lazy: no intenta conectar PostgreSQL/Neon durante el import del módulo.
-- Imports pesados diferidos hasta el momento de procesar un archivo.
-- Mantiene continuidad, reintento y corrección visual de la v69.
-
 # Changelog
 
+## 70.0.0
+- OCR opt-in: queda apagado por defecto para evitar interrupciones del job en Render.
+- Presentación visual menos agresiva y más fiel al original.
+- Reconstrucción de trazos más conservadora para evitar empastado y ennegrecimiento.
+- Ayudas opcionales con acciones OCR explícitas y modo seguro por defecto.
+
 ## 69.1.0
-- Recuperación y reintento robusto de tareas interrumpidas.
-- Persistencia opcional del archivo original en la metadata del job para reanudar/reintentar.
-- OCR en modo seguro por presupuesto de tiempo/regiones.
-- Reconstrucción estructural base para cerrar microcortes.
+- Arranque blindado para Render.

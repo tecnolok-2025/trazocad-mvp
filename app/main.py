@@ -26,7 +26,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '69.1.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '70.0.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,7 +50,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad release 69.1 de arranque blindado para Render: health check explícito, persistencia lazy y servicios pesados diferidos hasta el procesamiento.',
+    description='TrazoCad release 70 de estabilidad y fidelidad: OCR opt-in, procesamiento seguro para Render y presentación visual menos agresiva.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -79,7 +79,7 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'arranque blindado y health check explícito',
+        'linea': 'estabilidad y fidelidad con OCR opt-in',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),
@@ -483,7 +483,7 @@ def infra() -> JSONResponse:
                 'nota': 'La release privilegia estabilidad y usa PostgreSQL/Neon cuando está disponible y mantiene un espejo local SQLite para recuperar estado ante reinicios o fallos transitorios.',
             },
             'persistencia': persistence.stats(),
-            'alcance': 'Release 69.1 de arranque blindado: health check liviano, persistencia lazy, imports pesados diferidos y continuidad de procesamiento sin cargar el startup.',
+            'alcance': 'Release 70: OCR opt-in para evitar interrupciones en Render, presentación más fiel y procesamiento menos agresivo.',
         }
     )
 
@@ -707,7 +707,7 @@ def product_state() -> dict:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'estado': 'release profesional final',
+        'estado': 'release 70 de estabilidad y fidelidad',
         'criterio': [
             'interfaz simple',
             'DXF limpio',

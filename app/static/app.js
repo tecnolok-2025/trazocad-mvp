@@ -25,24 +25,24 @@ const notesFree = document.getElementById('notesFree');
 
 const NOTE_PRESETS = {
   fidelidad: [
-    { value: 'Preservar el plano completo y evitar limpieza agresiva en áreas débiles.', label: 'Preservar plano completo' },
-    { value: 'Reconstruir trazos finos y punteados sin deformar la geometría principal.', label: 'Reforzar trazos finos y punteados' },
-    { value: 'Priorizar fidelidad visual por encima de simplificación extrema.', label: 'Priorizar fidelidad visual' },
+    { value: '[SAFE][FIDELITY] Preservar el plano completo y evitar limpieza agresiva en áreas débiles.', label: 'Preservar plano completo' },
+    { value: '[SAFE][FIDELITY][DASHED] Conservar líneas finas, punteadas y ejes sin reforzarlas en exceso.', label: 'Conservar trazos finos y punteados' },
+    { value: '[SAFE][FIDELITY] Priorizar fidelidad visual por encima de simplificación extrema.', label: 'Priorizar fidelidad visual' },
   ],
   rotulo: [
-    { value: 'Preservar y reforzar el rótulo inferior derecho y las referencias.', label: 'Preservar rótulo inferior derecho' },
-    { value: 'Intentar OCR dirigido sobre rótulo, referencias y notas.', label: 'OCR dirigido a rótulo y notas' },
-    { value: 'No recortar ni limpiar agresivamente el cuadro de rótulo.', label: 'Evitar limpieza agresiva del rótulo' },
+    { value: '[SAFE][TITLE] Preservar rótulo inferior derecho y referencias sin rellenarlo ni ennegrecerlo.', label: 'Preservar rótulo inferior derecho' },
+    { value: '[OCR][TITLE] Intentar OCR dirigido sobre rótulo, referencias y notas (más lento).', label: 'OCR dirigido a rótulo y notas' },
+    { value: '[SAFE][TITLE] Evitar limpieza agresiva dentro del cuadro de rótulo.', label: 'Evitar limpieza agresiva del rótulo' },
   ],
   cotas: [
-    { value: 'Priorizar cotas, ejes y textos numéricos aunque aumente el tiempo de proceso.', label: 'Priorizar cotas y ejes' },
-    { value: 'Intentar OCR dirigido sobre cotas y textos técnicos.', label: 'OCR dirigido a cotas' },
-    { value: 'Conservar líneas de cota y flechas aunque estén débiles.', label: 'Conservar líneas de cota' },
+    { value: '[SAFE][DASHED] Conservar líneas de cota, ejes y flechas aunque estén débiles.', label: 'Conservar líneas de cota' },
+    { value: '[OCR][DIMENSIONS] Intentar OCR dirigido sobre cotas y textos técnicos (más lento).', label: 'OCR dirigido a cotas' },
+    { value: '[SAFE][FIDELITY] Priorizar lectura visual de cotas y ejes antes que limpieza extrema.', label: 'Priorizar lectura visual de cotas' },
   ],
   geometria: [
-    { value: 'Reconstruir perímetros, arcos y contornos incompletos del dibujo.', label: 'Reconstruir perímetros y arcos' },
-    { value: 'Cerrar pequeños cortes de línea sin deformar el plano.', label: 'Cerrar cortes pequeños de línea' },
-    { value: 'Priorizar ejes estructurales, marcos y contornos dominantes.', label: 'Priorizar ejes y contornos dominantes' },
+    { value: '[SAFE][GEOMETRY] Cerrar pequeños cortes de línea solo cuando la continuidad sea clara.', label: 'Cerrar cortes pequeños de línea' },
+    { value: '[SAFE][GEOMETRY] Priorizar ejes estructurales, marcos y contornos dominantes sin oscurecer el plano.', label: 'Priorizar ejes y contornos dominantes' },
+    { value: '[SAFE][GEOMETRY][RECONSTRUCT] Reconstruir perímetros y arcos con criterio conservador.', label: 'Reconstruir perímetros y arcos' },
   ],
 };
 
@@ -71,7 +71,7 @@ function composeNotes() {
 
 const CURRENT_JOB_STORAGE_KEY = 'trazocad.currentJobId';
 const MAX_UPLOAD_MB = 25;
-const POLL_INTERVAL_MS = 2500;
+const POLL_INTERVAL_MS = 3000;
 const MAX_POLL_FAILURES = 6;
 const ALLOWED_EXTENSIONS = ['png', 'jpg', 'jpeg', 'bmp', 'tif', 'tiff'];
 
@@ -218,7 +218,7 @@ function updateStatus(payload) {
       : state === 'recovering'
         ? 'El servidor está reconstruyendo el estado de la tarea. No cierres esta pestaña.'
         : state === 'missing'
-          ? 'La tarea se interrumpió en el servidor. TrazoCad va a intentar reanudarla automáticamente si todavía existe una copia recuperable del archivo.'
+          ? 'La tarea se interrumpió en el servidor. En v70 el OCR es opcional para reducir este problema; TrazoCad va a intentar reanudarla automáticamente si todavía existe una copia recuperable del archivo.'
           : 'Procesando el archivo en segundo plano.';
   stageLabel.textContent = `Etapa: ${stage.replaceAll('_', ' ')}`;
   jobLabel.textContent = `Job: ${payload?.job_id || '—'}`;
@@ -379,7 +379,7 @@ form.addEventListener('submit', async (event) => {
   pollingStartedAt = Date.now();
   autoRetryCount = 0;
   statusMessage.textContent = 'Enviando el archivo al servidor…';
-  statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano.';
+  statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano. El OCR queda apagado por defecto salvo que se solicite explícitamente.';
   stageLabel.textContent = 'Etapa: cola';
   jobLabel.textContent = 'Job: preparando';
   timeLabel.textContent = 'Tiempo: 0 s';

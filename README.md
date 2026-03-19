@@ -20,3 +20,10 @@ La interfaz incluye una temática y una acción sugerida que se convierten en no
 
 ## OCR
 La versión incorpora RapidOCR por regiones. Si el motor OCR no está disponible, la app sigue funcionando y conserva los textos/rótulos en las salidas raster y en el DXF de nube de puntos.
+
+
+## Notas de la v70
+
+- El OCR queda desactivado por defecto para priorizar estabilidad en Render.
+- Solo se activa si el usuario elige una acción OCR desde la interfaz.
+- La imagen de presentación fue suavizada para evitar líneas negras demasiado agresivas y preservar mejor el rótulo.

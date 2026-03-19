@@ -66,8 +66,8 @@ def build_report_pdf(output_path: Path, result: dict[str, Any], drawing_type: st
     page_width, page_height = _resolve_sheet_size(sheet_size, orientation)
     page = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
 
-    frame_margin = 5 * mm
-    footer_height = 9 * mm
+    frame_margin = 3.5 * mm
+    footer_height = 6 * mm
     drawable_left = frame_margin
     drawable_bottom = frame_margin + footer_height
     drawable_width = page_width - 2 * frame_margin
@@ -93,10 +93,10 @@ def build_report_pdf(output_path: Path, result: dict[str, Any], drawing_type: st
             page.drawImage(str(cropped), render_x, render_y, width=render_w, height=render_h, preserveAspectRatio=True, mask='auto')
 
     page.setFillColor(Color(0.22, 0.27, 0.33))
-    page.setFont('Helvetica-Bold', 7.5)
+    page.setFont('Helvetica-Bold', 6.8)
     page.drawString(frame_margin + 2.5 * mm, frame_margin + 5.6 * mm, 'TrazoCad | Tecno Logisti-K SA')
 
-    page.setFont('Helvetica', 6.2)
+    page.setFont('Helvetica', 5.8)
     file_label = (original_filename or 'archivo_sin_nombre')[:64]
     page.drawString(frame_margin + 2.5 * mm, frame_margin + 2.0 * mm, f'Archivo: {file_label}')
 
