@@ -276,41 +276,50 @@ def _repair_broken_traces(binary: np.ndarray, directives: dict[str, bool] | None
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
         cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1)),
         cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
     ]
     if directives.get('reconstruct_perimeters'):
         kernels.extend([
-            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)),
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 9)),
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
         ])
     if directives.get('preserve_dashed'):
         kernels.extend([
-            cv2.getStructuringElement(cv2.MORPH_RECT, (11, 1)),
-            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 11)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1)),
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7)),
         ])
-    diag1 = np.eye(5, dtype=np.uint8)
+    diag1 = np.eye(3, dtype=np.uint8)
     diag2 = np.fliplr(diag1)
+    before_fill = float(cv2.countNonZero(repaired)) / float(max(repaired.size, 1))
     for kernel in kernels + [diag1, diag2]:
-        repaired = cv2.morphologyEx(repaired, cv2.MORPH_CLOSE, kernel, iterations=1)
+        candidate = cv2.morphologyEx(repaired, cv2.MORPH_CLOSE, kernel, iterations=1)
+        candidate_fill = float(cv2.countNonZero(candidate)) / float(max(candidate.size, 1))
+        if candidate_fill <= min(0.22, before_fill + 0.025):
+            repaired = candidate
+            before_fill = candidate_fill
     repaired = cv2.bitwise_or(repaired, binary)
     return repaired
 
 
 def _reinforce_title_block(binary: np.ndarray, directives: dict[str, bool] | None = None) -> np.ndarray:
     directives = directives or {}
+    if not directives.get('preserve_title_block'):
+        return binary
     h, w = binary.shape[:2]
-    y1, x1 = int(h * (0.64 if directives.get('preserve_title_block') else 0.68)), int(w * (0.62 if directives.get('preserve_title_block') else 0.66))
+    y1, x1 = int(h * 0.68), int(w * 0.66)
     roi = binary[y1:h, x1:w].copy()
     if roi.size == 0:
         return binary
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, roi.shape[1] // (22 if directives.get('preserve_title_block') else 28)), 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(9, roi.shape[0] // (14 if directives.get('preserve_title_block') else 18))))
-    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, h_kernel, iterations=1)
-    roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, v_kernel, iterations=1)
+    base_fill = float(cv2.countNonZero(roi)) / float(max(roi.size, 1))
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(7, roi.shape[1] // 34), 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(7, roi.shape[0] // 24)))
+    candidate = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, h_kernel, iterations=1)
+    candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, v_kernel, iterations=1)
+    candidate_fill = float(cv2.countNonZero(candidate)) / float(max(candidate.size, 1))
+    if candidate_fill > min(0.18, base_fill * 1.8 + 0.03):
+        return binary
     out = binary.copy()
-    out[y1:h, x1:w] = cv2.bitwise_or(out[y1:h, x1:w], roi)
+    out[y1:h, x1:w] = cv2.bitwise_or(out[y1:h, x1:w], candidate)
     return out
 
 
@@ -1156,24 +1165,41 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
     return clean
 
 def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None) -> np.ndarray:
-    base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
-    soft = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
-    soft = cv2.medianBlur(soft, 3)
-    recovered = cv2.bitwise_or(cv2.bitwise_not(soft), repaired_binary)
-    recovered = cv2.bitwise_or(recovered, binary)
     directives = directives or {}
     title_blocks = title_blocks or []
-    presentation_gray = cv2.bitwise_not(recovered)
-    presentation_gray = cv2.normalize(presentation_gray, None, 0, 255, cv2.NORM_MINMAX)
     original_gray = cv2.normalize(normalized_gray, None, 0, 255, cv2.NORM_MINMAX)
-    if directives.get('prioritize_fidelity') or directives.get('preserve_dashed'):
-        presentation_gray = _blend_min(presentation_gray, original_gray)
+    presentation_gray = original_gray.copy()
+
+    base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+    detail = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
+    detail = cv2.medianBlur(detail, 3)
+    detail = cv2.min(detail, original_gray)
+
+    repair_delta = cv2.bitwise_and(repaired_binary, cv2.bitwise_not(binary))
+    repair_delta = cv2.morphologyEx(repair_delta, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    if cv2.countNonZero(repair_delta) > 0:
+        repair_delta = _skeletonize(repair_delta)
+    if directives.get('reconstruct_perimeters'):
+        line_mask = cv2.bitwise_or(binary, repair_delta)
+    else:
+        line_mask = binary
+
+    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    line_mask = cv2.GaussianBlur(line_mask, (0, 0), 0.6)
+    line_mask_f = line_mask.astype(np.float32) / 255.0
+    darken = 38.0 if directives.get('prioritize_fidelity') else 30.0
+    presentation_gray = np.clip(presentation_gray.astype(np.float32) - line_mask_f * darken, 0, 255).astype(np.uint8)
+
+    if directives.get('preserve_dashed') or directives.get('prioritize_fidelity'):
+        presentation_gray = cv2.min(presentation_gray, detail)
+
     for box in title_blocks:
         presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, box, pad=18 if directives.get('preserve_title_block') else 10)
     if directives.get('preserve_title_block'):
         h, w = presentation_gray.shape[:2]
-        title_guess = {'x': int(w * 0.58), 'y': int(h * 0.62), 'w': int(w * 0.40), 'h': int(h * 0.34)}
-        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=12)
+        title_guess = {'x': int(w * 0.60), 'y': int(h * 0.64), 'w': int(w * 0.36), 'h': int(h * 0.28)}
+        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=10)
+
     return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
 
 
