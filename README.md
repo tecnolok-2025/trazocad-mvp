@@ -1,4 +1,6 @@
-# TrazoCad v69
+# TrazoCad v71
+
+Versión enfocada en **preservación documental**: la presentación visual parte del plano original normalizado, con tratamiento separado para rótulo, notas y título del plano.
 
 TrazoCad es una aplicación de Tecno Logisti-K SA para digitalizar croquis, fotos o planos escaneados y generar DXF, PDF, JPG y PNG.
 
@@ -22,8 +24,14 @@ La interfaz incluye una temática y una acción sugerida que se convierten en no
 La versión incorpora RapidOCR por regiones. Si el motor OCR no está disponible, la app sigue funcionando y conserva los textos/rótulos en las salidas raster y en el DXF de nube de puntos.
 
 
-## Notas de la v70
+## Notas de la v71
 
 - El OCR queda desactivado por defecto para priorizar estabilidad en Render.
 - Solo se activa si el usuario elige una acción OCR desde la interfaz.
 - La imagen de presentación fue suavizada para evitar líneas negras demasiado agresivas y preservar mejor el rótulo.
+
+
+## Corrección de la v71
+- Cache busting de estáticos para evitar que el navegador muestre una versión vieja.
+- Cabeceras no-store en HTML y respuestas JSON de versión/infra/health.
+- Alineación completa de numeración visible en README y UI.

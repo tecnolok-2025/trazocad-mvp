@@ -2,7 +2,7 @@ services:
   - type: web
     name: trazocad-mvp
     runtime: python
-    plan: free
+    plan: starter
     region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -12,3 +12,17 @@ services:
         value: 3.11.9
       - key: DATABASE_URL
         sync: false
+      - key: TRAZOCAD_ENABLE_OCR_BY_DEFAULT
+        value: "0"
+      - key: TRAZOCAD_MAX_DIMENSION_PX
+        value: "2200"
+      - key: TRAZOCAD_MAX_MEGAPIXELS
+        value: "4.2"
+      - key: TRAZOCAD_REPORT_MAX_WIDTH
+        value: "1400"
+      - key: TRAZOCAD_DISABLE_OVERLAY_OUTPUT
+        value: "1"
+      - key: TRAZOCAD_DISABLE_ANALYSIS_PREVIEW
+        value: "1"
+      - key: TRAZOCAD_OCR_TIME_BUDGET_S
+        value: "6"

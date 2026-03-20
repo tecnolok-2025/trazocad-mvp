@@ -106,12 +106,31 @@ def _save_image(path: Path, image: np.ndarray) -> None:
     path.write_bytes(encoded.tobytes())
 
 
-def _resize_for_report(image: np.ndarray, max_width: int = 1600) -> np.ndarray:
+def _resize_for_report(image: np.ndarray, max_width: int | None = None) -> np.ndarray:
+    max_width = max_width or int(os.getenv('TRAZOCAD_REPORT_MAX_WIDTH', '1400'))
     height, width = image.shape[:2]
     if width <= max_width:
         return image
     ratio = max_width / float(width)
     return cv2.resize(image, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
+
+
+def _apply_memory_budget(image: np.ndarray) -> np.ndarray:
+    max_dimension = int(os.getenv('TRAZOCAD_MAX_DIMENSION_PX', '2200'))
+    max_megapixels = float(os.getenv('TRAZOCAD_MAX_MEGAPIXELS', '4.2'))
+    h, w = image.shape[:2]
+    scale = 1.0
+    longest = max(h, w)
+    if longest > max_dimension:
+        scale = min(scale, max_dimension / float(longest))
+    megapixels = (h * w) / 1_000_000.0
+    if megapixels > max_megapixels:
+        scale = min(scale, (max_megapixels / megapixels) ** 0.5)
+    if scale >= 0.999:
+        return image
+    new_w = max(640, int(round(w * scale)))
+    new_h = max(640, int(round(h * scale)))
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def _parse_user_directives(notes: str) -> dict[str, bool]:
@@ -177,6 +196,36 @@ def _restore_region_from_gray(base_gray: np.ndarray, original_gray: np.ndarray, 
         return restored
     restored[y1:y2, x1:x2] = _blend_min(restored[y1:y2, x1:x2], original_gray[y1:y2, x1:x2])
     return restored
+
+
+def _documental_regions(image_shape: tuple[int, int], title_blocks: list[dict[str, int]] | None = None) -> list[dict[str, int]]:
+    h, w = image_shape[:2]
+    title_blocks = title_blocks or []
+    regions: list[dict[str, int]] = []
+    # Zona documental: rótulo, referencias/notas sobre rótulo y título inferior del plano.
+    if title_blocks:
+        for box in title_blocks:
+            regions.append(dict(box))
+            regions.append({
+                'x': max(0, int(box['x'] - w * 0.02)),
+                'y': max(0, int(box['y'] - h * 0.14)),
+                'w': min(w - max(0, int(box['x'] - w * 0.02)), int(box['w'] + w * 0.04)),
+                'h': min(h - max(0, int(box['y'] - h * 0.14)), int(box['h'] + h * 0.16)),
+            })
+    else:
+        regions.append({'x': int(w * 0.72), 'y': int(h * 0.68), 'w': int(w * 0.24), 'h': int(h * 0.24)})
+        regions.append({'x': int(w * 0.70), 'y': int(h * 0.58), 'w': int(w * 0.26), 'h': int(h * 0.16)})
+    regions.append({'x': int(w * 0.34), 'y': int(h * 0.88), 'w': int(w * 0.34), 'h': int(h * 0.08)})
+    return regions
+
+
+def _enhance_documental_roi(roi: np.ndarray) -> np.ndarray:
+    if roi.size == 0:
+        return roi
+    clahe = cv2.createCLAHE(clipLimit=1.3, tileGridSize=(6, 6))
+    enhanced = clahe.apply(roi)
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 0.35)
+    return cv2.addWeighted(enhanced, 1.06, blur, -0.06, 0)
 
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -259,11 +308,12 @@ def _normalize_background(gray: np.ndarray) -> np.ndarray:
 def _enhance_image(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     normalized = _normalize_background(gray)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
     contrast = clahe.apply(normalized)
-    denoised = cv2.fastNlMeansDenoising(contrast, None, 6, 7, 21)
-    gaussian = cv2.GaussianBlur(denoised, (0, 0), 0.9)
-    sharpened = cv2.addWeighted(denoised, 1.18, gaussian, -0.18, 0)
+    # En v71 priorizamos preservar texto fino y rótulo sobre "limpiar" de más.
+    # Cambiamos NLM por un filtrado mucho más liviano y menos destructivo.
+    denoised = cv2.GaussianBlur(contrast, (0, 0), 0.45)
+    sharpened = cv2.addWeighted(contrast, 1.10, denoised, -0.10, 0)
     whitened = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     return sharpened, normalized, whitened
 
@@ -1168,67 +1218,39 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
         cv2.rectangle(clean, (item["x"], item["y"]), (item["x"] + item["w"], item["y"] + item["h"]), (170, 170, 220), 1)
     return clean
 
-def _build_presentation_image(enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None) -> np.ndarray:
+def _build_presentation_image(source_bgr: np.ndarray, enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None) -> np.ndarray:
     directives = directives or {}
     title_blocks = title_blocks or []
+    source_gray = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
     original_gray = cv2.normalize(normalized_gray, None, 0, 255, cv2.NORM_MINMAX)
     base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Base suave y fiel, evitando una máscara dura tipo vectorizado.
-    presentation_gray = cv2.addWeighted(original_gray, 0.82, base_gray, 0.18, 0)
+    # En v71 la presentación sale desde el documento original suavemente normalizado.
+    presentation_gray = cv2.addWeighted(source_gray, 0.97, original_gray, 0.03, 0)
 
-    # Refuerzo leve de líneas, nunca agresivo.
-    if directives.get('reconstruct_perimeters') or directives.get('preserve_dashed'):
-        line_mask = cv2.bitwise_or(binary, cv2.bitwise_and(repaired_binary, cv2.bitwise_not(binary)))
-        line_mask = cv2.GaussianBlur(line_mask, (0, 0), 0.45)
-        line_mask_f = line_mask.astype(np.float32) / 255.0
-        presentation_gray = np.clip(presentation_gray.astype(np.float32) - line_mask_f * 10.0, 0, 255).astype(np.uint8)
-
-    # Si se prioriza fidelidad, se reinserta detalle fino del original sin endurecerlo.
-    if directives.get('prioritize_fidelity') or directives.get('preserve_title_block'):
-        detail = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 6)
-        detail = cv2.medianBlur(detail, 3)
-        presentation_gray = cv2.min(presentation_gray, cv2.addWeighted(detail, 0.18, original_gray, 0.82, 0))
-
-    # Restaurar el rótulo desde el gris original para que no se empaste ni se pierda.
-    for box in title_blocks:
-        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, box, pad=20 if directives.get('preserve_title_block') else 10)
-    if directives.get('preserve_title_block'):
-        h, w = presentation_gray.shape[:2]
-        title_guess = {'x': int(w * 0.62), 'y': int(h * 0.66), 'w': int(w * 0.34), 'h': int(h * 0.26)}
-        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=10)
-
-    return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
-
-    base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
-    detail = cv2.adaptiveThreshold(base_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 7)
-    detail = cv2.medianBlur(detail, 3)
-    detail = cv2.min(detail, original_gray)
-
-    repair_delta = cv2.bitwise_and(repaired_binary, cv2.bitwise_not(binary))
-    repair_delta = cv2.morphologyEx(repair_delta, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    if cv2.countNonZero(repair_delta) > 0:
-        repair_delta = _skeletonize(repair_delta)
-    if directives.get('reconstruct_perimeters'):
-        line_mask = cv2.bitwise_or(binary, repair_delta)
-    else:
-        line_mask = binary
-
-    line_mask = cv2.morphologyEx(line_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    line_mask = cv2.GaussianBlur(line_mask, (0, 0), 0.6)
+    # Refuerzo muy leve solo para líneas ya presentes; evita empastar texto y rótulo.
+    line_source = binary if not directives.get('reconstruct_perimeters') else cv2.bitwise_or(binary, cv2.bitwise_and(repaired_binary, cv2.bitwise_not(binary)))
+    line_mask = cv2.GaussianBlur(line_source, (0, 0), 0.40)
     line_mask_f = line_mask.astype(np.float32) / 255.0
-    darken = 38.0 if directives.get('prioritize_fidelity') else 30.0
+    darken = 3.0 if directives.get('prioritize_fidelity') or directives.get('preserve_dashed') else 1.5
     presentation_gray = np.clip(presentation_gray.astype(np.float32) - line_mask_f * darken, 0, 255).astype(np.uint8)
 
-    if directives.get('preserve_dashed') or directives.get('prioritize_fidelity'):
-        presentation_gray = cv2.min(presentation_gray, detail)
+    # Zonas documentales: restauración y micro-realce del original para mantener textos/rótulo nítidos.
+    for box in _documental_regions(presentation_gray.shape, title_blocks):
+        x1 = max(0, int(box['x']))
+        y1 = max(0, int(box['y']))
+        x2 = min(presentation_gray.shape[1], x1 + int(box['w']))
+        y2 = min(presentation_gray.shape[0], y1 + int(box['h']))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi = source_gray[y1:y2, x1:x2]
+        enhanced_roi = _enhance_documental_roi(roi)
+        presentation_gray[y1:y2, x1:x2] = cv2.min(presentation_gray[y1:y2, x1:x2], enhanced_roi)
 
-    for box in title_blocks:
-        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, box, pad=18 if directives.get('preserve_title_block') else 10)
-    if directives.get('preserve_title_block'):
-        h, w = presentation_gray.shape[:2]
-        title_guess = {'x': int(w * 0.60), 'y': int(h * 0.64), 'w': int(w * 0.36), 'h': int(h * 0.28)}
-        presentation_gray = _restore_region_from_gray(presentation_gray, original_gray, title_guess, pad=10)
+    # Si se pidió fidelidad, se conserva más detalle fino del original sin endurecerlo.
+    if directives.get('prioritize_fidelity') or directives.get('preserve_title_block'):
+        detail = cv2.GaussianBlur(source_gray, (0, 0), 0.15)
+        presentation_gray = cv2.addWeighted(presentation_gray, 0.98, detail, 0.02, 0)
 
     return cv2.cvtColor(presentation_gray, cv2.COLOR_GRAY2BGR)
 
@@ -1434,6 +1456,8 @@ def process_drawing(
     if page_detected:
         image, transform_matrix = _warp_document(image, corners)
 
+    image = _apply_memory_budget(image)
+
     if progress_callback:
         progress_callback("reconstruyendo_base")
     image, auto_upscaled, upscale_factor = _auto_upscale(image)
@@ -1541,10 +1565,9 @@ def process_drawing(
         cv2.putText(overlay, "A", (p1[0] + 10, p1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (30, 60, 220), 2, cv2.LINE_AA)
         cv2.putText(overlay, "B", (p2[0] + 10, p2[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 50, 50), 2, cv2.LINE_AA)
 
-    reconstruction_preview = enhanced_bgr.copy()
-    analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
+    reconstruction_preview = enhanced_bgr
     vector_base = _build_vector_base(graphics_binary, ocr_items)
-    presentation_base = _build_presentation_image(enhanced_bgr, normalized_gray, binary, repaired_binary, geometry.get("title_blocks", []), directives)
+    presentation_base = _build_presentation_image(image, enhanced_bgr, normalized_gray, binary, repaired_binary, geometry.get("title_blocks", []), directives)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"
@@ -1555,8 +1578,11 @@ def process_drawing(
     _save_image(reconstruction_path, _resize_for_report(reconstruction_preview))
     _save_image(cleaned_path, _resize_for_report(vector_base))
     _save_image(presentation_path, _resize_for_report(presentation_base))
-    _save_image(overlay_path, _resize_for_report(overlay))
-    _save_image(original_path, _resize_for_report(analysis_preview))
+    if os.getenv('TRAZOCAD_DISABLE_OVERLAY_OUTPUT', '1').strip().lower() not in {'1', 'true', 'yes', 'si'}:
+        _save_image(overlay_path, _resize_for_report(overlay))
+    if os.getenv('TRAZOCAD_DISABLE_ANALYSIS_PREVIEW', '1').strip().lower() not in {'1', 'true', 'yes', 'si'}:
+        analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
+        _save_image(original_path, _resize_for_report(analysis_preview))
 
     assumptions = [
         f"Tipo de plano interpretado: {drawing_type}.",

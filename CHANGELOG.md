@@ -1,3 +1,13 @@
+## v71.0.0
+- Presentación visual reconstruida desde el documento original normalizado, no desde una máscara dura.
+- Preservación documental específica para rótulo, notas/referencias y título inferior del plano.
+- PDF con más área útil y pie reducido.
+- Realce más suave para conservar texto fino y evitar degradación visual.
+
+## v71.0.0
+- Corrección de versionado visible y cache busting de estáticos.
+- Cabeceras no-store para evitar servir UI vieja tras un deploy.
+
 # Changelog
 
 ## 70.0.0
