@@ -145,7 +145,7 @@ def _missing_outputs(job_id: str) -> list[str]:
 
 def _preferred_clean_image(result: dict) -> Path:
     output_files = result.get('output_files', {}) if isinstance(result, dict) else {}
-    for key in ('presentation_image', 'cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
+    for key in ('presentation_image', 'original_preview', 'cleaned_full_image', 'cleaned_image', 'graphics_mask', 'original_preview'):
         raw = output_files.get(key)
         if raw and Path(raw).exists():
             return Path(raw)
@@ -342,6 +342,7 @@ def _build_result_payload(job_id: str, file_name: str, sheet_size: str, drawing_
         image_width=result['processed_width_px'],
         image_height=result['processed_height_px'],
         mm_per_px=result['estimated_scale_mm_per_px'],
+        raster_path=cleaned_source,
     )
     dxf_points_path = export_to_point_cloud_dxf(
         output_path=output_dir / EXPECTED_OUTPUTS['dxf_nube_puntos'],

@@ -4,7 +4,9 @@ import math
 from pathlib import Path
 from typing import Any
 
+import cv2
 import ezdxf
+import numpy as np
 from ezdxf.enums import TextEntityAlignment
 from PIL import Image
 
@@ -13,10 +15,8 @@ def _documental_regions_from_geometry(geometry: dict[str, Any], image_width: int
     regions = [dict(box) for box in geometry.get('title_blocks', [])]
     if not regions:
         regions.append({'x': image_width * 0.72, 'y': image_height * 0.68, 'w': image_width * 0.24, 'h': image_height * 0.24})
-    # notas / referencias por encima del rótulo
-    regions.append({'x': image_width * 0.68, 'y': image_height * 0.58, 'w': image_width * 0.28, 'h': image_height * 0.22})
-    # título centrado inferior
-    regions.append({'x': image_width * 0.34, 'y': image_height * 0.88, 'w': image_width * 0.34, 'h': image_height * 0.08})
+    regions.append({'x': image_width * 0.68, 'y': image_height * 0.56, 'w': image_width * 0.30, 'h': image_height * 0.24})
+    regions.append({'x': image_width * 0.30, 'y': image_height * 0.86, 'w': image_width * 0.40, 'h': image_height * 0.10})
     return regions
 
 
@@ -93,7 +93,90 @@ def _near_text(line: dict[str, Any], text_items: list[dict[str, Any]], pad: floa
     return False
 
 
-def _sanitize_lines_for_dxf(lines: list[dict[str, Any]], documental: list[dict[str, float]], text_items: list[dict[str, Any]], image_width: int, image_height: int) -> list[dict[str, Any]]:
+def _load_support_map(raster_path: Path | None) -> np.ndarray | None:
+    if not raster_path or not raster_path.exists():
+        return None
+    img = cv2.imread(str(raster_path), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None
+    blur = cv2.GaussianBlur(img, (3, 3), 0)
+    binary = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 35, 7)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    return binary
+
+
+def _line_support_ratio(line: dict[str, Any], support_map: np.ndarray | None) -> float:
+    if support_map is None:
+        return 1.0
+    h, w = support_map.shape[:2]
+    x1 = int(round(float(line.get('x1', 0))))
+    y1 = int(round(float(line.get('y1', 0))))
+    x2 = int(round(float(line.get('x2', 0))))
+    y2 = int(round(float(line.get('y2', 0))))
+    dist = max(int(round(math.hypot(x2 - x1, y2 - y1))), 1)
+    samples = max(min(dist // 4, 180), 12)
+    hit = 0
+    for i in range(samples + 1):
+        t = i / max(samples, 1)
+        x = int(round(x1 + (x2 - x1) * t))
+        y = int(round(y1 + (y2 - y1) * t))
+        if x < 0 or y < 0 or x >= w or y >= h:
+            continue
+        x0, x3 = max(0, x - 1), min(w, x + 2)
+        y0, y3 = max(0, y - 1), min(h, y + 2)
+        if np.any(support_map[y0:y3, x0:x3] > 0):
+            hit += 1
+    return hit / max(samples + 1, 1)
+
+
+def _detect_document_boxes(support_map: np.ndarray | None, image_width: int, image_height: int) -> list[dict[str, float]]:
+    if support_map is None:
+        return []
+    h, w = support_map.shape[:2]
+    roi = support_map[int(h * 0.52):, int(w * 0.54):]
+    if roi.size == 0:
+        return []
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    merged = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: list[dict[str, float]] = []
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < (w * h) * 0.01:
+            continue
+        if bw < w * 0.14 or bh < h * 0.08:
+            continue
+        abs_x = x + int(w * 0.54)
+        abs_y = y + int(h * 0.52)
+        abs_w = min(bw, max(1, image_width - abs_x))
+        abs_h = min(bh, max(1, image_height - abs_y))
+        boxes.append({
+            'x': abs_x,
+            'y': abs_y,
+            'w': abs_w,
+            'h': abs_h,
+        })
+    return boxes
+
+
+def _extract_supported_hv_lines(support_map: np.ndarray | None, image_width: int, image_height: int) -> list[dict[str, float]]:
+    if support_map is None:
+        return []
+    lines_p = cv2.HoughLinesP(support_map, 1, np.pi / 180, threshold=80, minLineLength=max(40, int(max(image_width, image_height) * 0.08)), maxLineGap=8)
+    if lines_p is None:
+        return []
+    extra: list[dict[str, float]] = []
+    for item in lines_p[:, 0, :]:
+        x1, y1, x2, y2 = [float(v) for v in item]
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        if min(dx, dy) > max(4.0, max(dx, dy) * 0.08):
+            continue
+        extra.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+    return extra
+
+
+def _sanitize_lines_for_dxf(lines: list[dict[str, Any]], documental: list[dict[str, float]], text_items: list[dict[str, Any]], image_width: int, image_height: int, support_map: np.ndarray | None = None) -> list[dict[str, Any]]:
     img_long = max(image_width, image_height)
     expanded_doc = [_expanded_region(r, 18.0) for r in documental]
     connectivity = _build_connectivity(lines, tolerance=max(14.0, img_long * 0.006))
@@ -108,15 +191,19 @@ def _sanitize_lines_for_dxf(lines: list[dict[str, Any]], documental: list[dict[s
         axis_like = _is_axis_like(line)
         connected = connectivity[idx]
         near_text = _near_text(line, text_items)
+        support = _line_support_ratio(line, support_map)
 
-        # regla central: mejor incompleto pero correcto que espurio
-        if overlap > 0.55 and length < img_long * 0.35:
+        if support < 0.28 and length < img_long * 0.22:
             continue
-        if overlap > 0.18 and near_text and length < img_long * 0.18:
+        if support < 0.16:
+            continue
+        if overlap > 0.55 and length < img_long * 0.35 and support < 0.72:
+            continue
+        if overlap > 0.18 and near_text and length < img_long * 0.18 and support < 0.68:
             continue
         if connected == 0 and length < img_long * 0.1 and not axis_like:
             continue
-        if connected <= 1 and length < img_long * 0.06:
+        if connected <= 1 and length < img_long * 0.06 and support < 0.7:
             continue
         if near_text and length < img_long * 0.05 and not axis_like:
             continue
@@ -178,15 +265,14 @@ def _add_text_item(msp, item: dict[str, Any], layer: str, height_mm: float, mm_p
         entity.set_placement((x_mm, y_mm), align=TextEntityAlignment.LEFT)
 
 
-def _add_title_block_fallback(msp, geometry: dict[str, Any], height_mm: float, mm_per_px: float) -> None:
-    for box in geometry.get('title_blocks', []) or []:
+def _add_title_block_fallback(msp, boxes: list[dict[str, Any]], height_mm: float, mm_per_px: float) -> None:
+    for box in boxes:
         x = float(box['x']) * mm_per_px
         y_top = height_mm - float(box['y']) * mm_per_px
         w = float(box['w']) * mm_per_px
         h = float(box['h']) * mm_per_px
         pts = [(x, y_top), (x + w, y_top), (x + w, y_top - h), (x, y_top - h), (x, y_top)]
         msp.add_lwpolyline(pts, dxfattribs={'layer': 'ROTULO', 'closed': True})
-        # subdivisión simple del rótulo para que no desaparezca como bloque vacío
         row1 = y_top - h * 0.42
         row2 = y_top - h * 0.72
         msp.add_line((x, row1), (x + w, row1), dxfattribs={'layer': 'ROTULO'})
@@ -205,6 +291,7 @@ def export_to_dxf(
     image_width: int,
     image_height: int,
     mm_per_px: float,
+    raster_path: Path | None = None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = ezdxf.new(dxfversion='R2010')
@@ -216,9 +303,15 @@ def export_to_dxf(
             doc.layers.add(layer, color=color)
 
     height_mm = image_height * mm_per_px
+    support_map = _load_support_map(raster_path)
     documental = _documental_regions_from_geometry(geometry, image_width, image_height)
+    inferred_doc_boxes = _detect_document_boxes(support_map, image_width, image_height)
+    if inferred_doc_boxes:
+        documental.extend(inferred_doc_boxes)
     text_items = geometry.get('texts', []) or []
-    lines = _sanitize_lines_for_dxf(geometry.get('lines', []), documental, text_items, image_width, image_height)
+    source_lines = list(geometry.get('lines', []))
+    source_lines.extend(_extract_supported_hv_lines(support_map, image_width, image_height))
+    lines = _sanitize_lines_for_dxf(source_lines, documental, text_items, image_width, image_height, support_map=support_map)
     dimension_lines = geometry.get('dimension_lines', []) or []
     cota_texts = geometry.get('cota_texts', []) or []
 
@@ -237,7 +330,7 @@ def export_to_dxf(
         region_hit = any(not (maxx < r['x'] or minx > r['x'] + r['w'] or maxy < r['y'] or miny > r['y'] + r['h']) for r in documental)
         width = maxx - minx
         height = maxy - miny
-        if region_hit and width < image_width * 0.14 and height < image_height * 0.14:
+        if region_hit and width < image_width * 0.12 and height < image_height * 0.12:
             continue
         pts = [(pt['x'] * mm_per_px, height_mm - pt['y'] * mm_per_px) for pt in poly]
         closed = len(poly) >= 3 and (poly[0]['x'], poly[0]['y']) == (poly[-1]['x'], poly[-1]['y'])
@@ -246,6 +339,8 @@ def export_to_dxf(
 
     for line in dimension_lines:
         if _line_length(line) < 10:
+            continue
+        if _line_support_ratio(line, support_map) < 0.22:
             continue
         msp.add_line(
             (line['x1'] * mm_per_px, height_mm - line['y1'] * mm_per_px),
@@ -260,7 +355,8 @@ def export_to_dxf(
     for item in geometry.get('rotulo_texts', []):
         _add_text_item(msp, item, 'ROTULO', height_mm, mm_per_px)
 
-    _add_title_block_fallback(msp, geometry, height_mm, mm_per_px)
+    title_boxes = geometry.get('title_blocks', []) or inferred_doc_boxes
+    _add_title_block_fallback(msp, title_boxes, height_mm, mm_per_px)
 
     doc.saveas(output_path)
     return output_path
@@ -275,7 +371,7 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
 
     def sample_line(x1: float, y1: float, x2: float, y2: float, local_step: float | None = None):
         nonlocal count
-        step = max(local_step or step_px, 1.5)
+        step = max(local_step or step_px, 1.4)
         dist = math.hypot(x2 - x1, y2 - y1)
         steps = max(int(dist / step), 1)
         for i in range(steps + 1):
@@ -286,55 +382,55 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
     for line in geometry.get('lines', []):
         sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)))
     for line in geometry.get('dimension_lines', []):
-        sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)), local_step=max(1.8, step_px * 0.55))
+        sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)), local_step=max(1.4, step_px * 0.4))
     for poly in geometry.get('polylines', []):
         if len(poly) < 2:
             continue
-        local_step = max(1.8, step_px * 0.55) if _poly_is_curve_like(poly) else step_px
+        local_step = max(1.4, step_px * 0.4) if _poly_is_curve_like(poly) else step_px
         for p1, p2 in zip(poly[:-1], poly[1:]):
             sample_line(float(p1.get('x', 0)), float(p1.get('y', 0)), float(p2.get('x', 0)), float(p2.get('y', 0)), local_step=local_step)
 
     return count
 
 
-def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, height_mm: float, mm_per_px: float, geometry: dict[str, Any] | None = None, step_px: float = 6.0) -> int:
+def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, height_mm: float, mm_per_px: float, geometry: dict[str, Any] | None = None, step_px: float = 4.0) -> int:
     count = 0
     geometry = geometry or {}
+    support_map = _load_support_map(raster_path)
+    if support_map is None:
+        return 0
     documental = _documental_regions_from_geometry(geometry, image_width, image_height)
-    with Image.open(raster_path) as image:
-        gray = image.convert('L')
-        width, height = gray.size
-        if width <= 0 or height <= 0:
-            return 0
-        base_step = max(int(round(step_px)), 2)
-        px = gray.load()
-        scale_x = image_width / float(width)
-        scale_y = image_height / float(height)
-        for y in range(0, height, base_step):
-            for x in range(0, width, base_step):
-                mapped_x = x * scale_x
-                mapped_y = y * scale_y
-                local_step = base_step
-                thresh = 230
-                documental_hit = False
-                for region in documental:
-                    if region['x'] <= mapped_x <= region['x'] + region['w'] and region['y'] <= mapped_y <= region['y'] + region['h']:
-                        documental_hit = True
-                        local_step = max(2, base_step // 2)
-                        thresh = 238
-                        break
-                if px[x, y] < thresh:
-                    _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
-                    count += 1
-                    neigh = [(local_step, 0), (0, local_step), (local_step, local_step)]
-                    if documental_hit:
-                        neigh += [(-local_step, local_step), (2 * local_step, 0), (0, 2 * local_step)]
-                    for dx, dy in neigh:
-                        xn = max(0, min(width - 1, x + dx))
-                        yn = max(0, min(height - 1, y + dy))
-                        if px[xn, yn] < thresh:
-                            _add_point(msp, xn * scale_x, yn * scale_y, height_mm, mm_per_px)
-                            count += 1
+    inferred_doc_boxes = _detect_document_boxes(support_map, image_width, image_height)
+    if inferred_doc_boxes:
+        documental.extend(inferred_doc_boxes)
+    height, width = support_map.shape[:2]
+    base_step = max(int(round(step_px)), 2)
+    scale_x = image_width / float(width)
+    scale_y = image_height / float(height)
+    for y in range(0, height, base_step):
+        for x in range(0, width, base_step):
+            mapped_x = x * scale_x
+            mapped_y = y * scale_y
+            local_step = base_step
+            documental_hit = False
+            for region in documental:
+                if region['x'] <= mapped_x <= region['x'] + region['w'] and region['y'] <= mapped_y <= region['y'] + region['h']:
+                    documental_hit = True
+                    local_step = max(2, base_step // 2)
+                    break
+            thresh_hit = support_map[y, x] > 0
+            if thresh_hit:
+                _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
+                count += 1
+                neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step)]
+                if documental_hit:
+                    neigh += [(2 * local_step, 0), (0, 2 * local_step), (2 * local_step, local_step)]
+                for dx, dy in neigh:
+                    xn = max(0, min(width - 1, x + dx))
+                    yn = max(0, min(height - 1, y + dy))
+                    if support_map[yn, xn] > 0:
+                        _add_point(msp, xn * scale_x, yn * scale_y, height_mm, mm_per_px)
+                        count += 1
     return count
 
 
@@ -345,7 +441,7 @@ def export_to_point_cloud_dxf(
     image_height: int,
     mm_per_px: float,
     raster_path: Path | None = None,
-    step_px: float = 6.0,
+    step_px: float = 4.0,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = ezdxf.new(dxfversion='R2010')

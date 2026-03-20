@@ -1,4 +1,4 @@
-# TrazoCad v74
+# TrazoCad v75
 
 Versión enfocada en **orquestación adaptativa**, OCR por regiones y saneamiento del DXF.
 
