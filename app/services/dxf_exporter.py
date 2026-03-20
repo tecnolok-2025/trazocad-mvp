@@ -176,6 +176,82 @@ def _extract_supported_hv_lines(support_map: np.ndarray | None, image_width: int
     return extra
 
 
+
+
+def _merge_axis_aligned_lines(lines: list[dict[str, float]], coord_snap: int = 8, gap_tol: float = 18.0) -> list[dict[str, float]]:
+    horizontals: dict[int, list[tuple[float, float, float]]] = {}
+    verticals: dict[int, list[tuple[float, float, float]]] = {}
+    diagonals: list[dict[str, float]] = []
+    for line in lines:
+        x1, y1, x2, y2 = [float(line[k]) for k in ('x1', 'y1', 'x2', 'y2')]
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        if dx >= dy * 4:
+            y = int(round(((y1 + y2) * 0.5) / coord_snap) * coord_snap)
+            horizontals.setdefault(y, []).append((min(x1, x2), max(x1, x2), (y1 + y2) * 0.5))
+        elif dy >= dx * 4:
+            x = int(round(((x1 + x2) * 0.5) / coord_snap) * coord_snap)
+            verticals.setdefault(x, []).append((min(y1, y2), max(y1, y2), (x1 + x2) * 0.5))
+        else:
+            diagonals.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+
+    merged: list[dict[str, float]] = []
+    for y, segs in horizontals.items():
+        segs.sort(key=lambda t: t[0])
+        cur_x1, cur_x2, cur_y = segs[0]
+        y_vals=[cur_y]
+        for x1, x2, yy in segs[1:]:
+            if x1 <= cur_x2 + gap_tol:
+                cur_x2 = max(cur_x2, x2)
+                y_vals.append(yy)
+            else:
+                merged.append({'x1': cur_x1, 'y1': sum(y_vals)/len(y_vals), 'x2': cur_x2, 'y2': sum(y_vals)/len(y_vals)})
+                cur_x1, cur_x2 = x1, x2
+                y_vals=[yy]
+        merged.append({'x1': cur_x1, 'y1': sum(y_vals)/len(y_vals), 'x2': cur_x2, 'y2': sum(y_vals)/len(y_vals)})
+
+    for x, segs in verticals.items():
+        segs.sort(key=lambda t: t[0])
+        cur_y1, cur_y2, cur_x = segs[0]
+        x_vals=[cur_x]
+        for y1, y2, xx in segs[1:]:
+            if y1 <= cur_y2 + gap_tol:
+                cur_y2 = max(cur_y2, y2)
+                x_vals.append(xx)
+            else:
+                merged.append({'x1': sum(x_vals)/len(x_vals), 'y1': cur_y1, 'x2': sum(x_vals)/len(x_vals), 'y2': cur_y2})
+                cur_y1, cur_y2 = y1, y2
+                x_vals=[xx]
+        merged.append({'x1': sum(x_vals)/len(x_vals), 'y1': cur_y1, 'x2': sum(x_vals)/len(x_vals), 'y2': cur_y2})
+
+    merged.extend(diagonals)
+    return merged
+
+
+def _extract_supported_contours(support_map: np.ndarray | None, image_width: int, image_height: int) -> list[list[dict[str, float]]]:
+    if support_map is None:
+        return []
+    work = cv2.morphologyEx(support_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    contours, _ = cv2.findContours(work, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    polys: list[list[dict[str, float]]] = []
+    img_area = float(image_width * image_height)
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        area = cv2.contourArea(cnt)
+        if peri < max(80.0, image_width * 0.04):
+            continue
+        if area < max(20.0, img_area * 0.00003):
+            continue
+        approx = cv2.approxPolyDP(cnt, max(1.5, 0.0035 * peri), True)
+        if len(approx) < 2:
+            continue
+        poly = [{'x': float(pt[0][0]), 'y': float(pt[0][1])} for pt in approx]
+        if len(poly) >= 3:
+            first, last = poly[0], poly[-1]
+            if math.hypot(first['x'] - last['x'], first['y'] - last['y']) > 1.5:
+                poly.append({'x': first['x'], 'y': first['y']})
+        polys.append(poly)
+    return polys
+
 def _sanitize_lines_for_dxf(lines: list[dict[str, Any]], documental: list[dict[str, float]], text_items: list[dict[str, Any]], image_width: int, image_height: int, support_map: np.ndarray | None = None) -> list[dict[str, Any]]:
     img_long = max(image_width, image_height)
     expanded_doc = [_expanded_region(r, 18.0) for r in documental]
@@ -310,8 +386,9 @@ def export_to_dxf(
         documental.extend(inferred_doc_boxes)
     text_items = geometry.get('texts', []) or []
     source_lines = list(geometry.get('lines', []))
-    source_lines.extend(_extract_supported_hv_lines(support_map, image_width, image_height))
+    source_lines.extend(_merge_axis_aligned_lines(_extract_supported_hv_lines(support_map, image_width, image_height)))
     lines = _sanitize_lines_for_dxf(source_lines, documental, text_items, image_width, image_height, support_map=support_map)
+    contour_polys = _extract_supported_contours(support_map, image_width, image_height)
     dimension_lines = geometry.get('dimension_lines', []) or []
     cota_texts = geometry.get('cota_texts', []) or []
 
@@ -323,7 +400,8 @@ def export_to_dxf(
             dxfattribs={'layer': layer},
         )
 
-    for poly in geometry.get('polylines', []):
+    exported_poly_keys: set[tuple[int, int, int, int]] = set()
+    for poly in geometry.get('polylines', []) + contour_polys:
         if len(poly) < 2:
             continue
         minx, miny, maxx, maxy = _poly_bbox(poly)
@@ -332,6 +410,10 @@ def export_to_dxf(
         height = maxy - miny
         if region_hit and width < image_width * 0.12 and height < image_height * 0.12:
             continue
+        bbox_key = tuple(int(round(v / 6) * 6) for v in (minx, miny, maxx, maxy))
+        if bbox_key in exported_poly_keys:
+            continue
+        exported_poly_keys.add(bbox_key)
         pts = [(pt['x'] * mm_per_px, height_mm - pt['y'] * mm_per_px) for pt in poly]
         closed = len(poly) >= 3 and (poly[0]['x'], poly[0]['y']) == (poly[-1]['x'], poly[-1]['y'])
         layer = 'CURVAS' if _poly_is_curve_like(poly) else ('ROTULO' if region_hit else 'GEOMETRIA')
@@ -383,7 +465,8 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
         sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)))
     for line in geometry.get('dimension_lines', []):
         sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)), local_step=max(1.4, step_px * 0.4))
-    for poly in geometry.get('polylines', []):
+    exported_poly_keys: set[tuple[int, int, int, int]] = set()
+    for poly in geometry.get('polylines', []) + contour_polys:
         if len(poly) < 2:
             continue
         local_step = max(1.4, step_px * 0.4) if _poly_is_curve_like(poly) else step_px
@@ -404,7 +487,7 @@ def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, 
     if inferred_doc_boxes:
         documental.extend(inferred_doc_boxes)
     height, width = support_map.shape[:2]
-    base_step = max(int(round(step_px)), 2)
+    base_step = max(int(round(step_px)), 1)
     scale_x = image_width / float(width)
     scale_y = image_height / float(height)
     for y in range(0, height, base_step):
@@ -416,13 +499,13 @@ def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, 
             for region in documental:
                 if region['x'] <= mapped_x <= region['x'] + region['w'] and region['y'] <= mapped_y <= region['y'] + region['h']:
                     documental_hit = True
-                    local_step = max(2, base_step // 2)
+                    local_step = max(1, base_step // 2)
                     break
             thresh_hit = support_map[y, x] > 0
             if thresh_hit:
                 _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
                 count += 1
-                neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step)]
+                neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step), (-local_step, 0), (0, -local_step)]
                 if documental_hit:
                     neigh += [(2 * local_step, 0), (0, 2 * local_step), (2 * local_step, local_step)]
                 for dx, dy in neigh:

@@ -1,6 +1,4 @@
-## v75.0.0
-- orquestador adaptativo de presupuesto por memoria
-- OCR regional con reducción automática por presión de memoria
-- saneamiento adicional de geometría para reducir líneas falsas en DXF
-- nube de puntos con densidad adaptativa y mejor detalle documental
-- actualización de versión visible y documentación
+## v76.0.0
+- Reconstruccion DXF dirigida por benchmark real.
+- Validacion de lineas contra raster y soporte horizontal/vertical real.
+- Nube de puntos mas densa en zonas documentales y del plano.
