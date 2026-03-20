@@ -187,7 +187,7 @@ def _adaptive_runtime_profile(image_shape: tuple[int, int, int], directives: dic
     ocr_allowed = directives.get('force_ocr', False) and pressure != 'critical'
     if directives.get('safe_mode') and pressure in {'high', 'critical'}:
         ocr_allowed = False
-    point_cloud_step = 8.0 if pressure == 'normal' else 10.0 if pressure == 'medium' else 12.0 if pressure == 'high' else 14.0
+    point_cloud_step = 6.0 if pressure == 'normal' else 8.0 if pressure == 'medium' else 10.0 if pressure == 'high' else 12.0
     return {
         'memory_mb': round(memory_mb, 1),
         'memory_pressure': pressure,
@@ -226,7 +226,12 @@ def _sanitize_geometry(geometry: dict[str, Any], documental_regions: list[dict[s
         if overlap > 0.55 and length < max(w, h) * 0.18:
             removed += 1
             continue
-        if length < 7:
+        dx, dy = abs(x2 - x1), abs(y2 - y1)
+        axis_like = dx < 2 or dy < 2 or (min(dx, dy) / max(dx, dy, 1.0) < 0.08)
+        if overlap > 0.08 and not axis_like and length < max(w, h) * 0.10:
+            removed += 1
+            continue
+        if length < 10:
             removed += 1
             continue
         clean_lines.append(line)
@@ -239,6 +244,9 @@ def _sanitize_geometry(geometry: dict[str, Any], documental_regions: list[dict[s
         box = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
         overlap = max((_region_intersection_ratio(box, region) for region in documental_regions), default=0.0)
         if overlap > 0.75 and (max(xs) - min(xs)) * (max(ys) - min(ys)) < (w * h) * 0.03:
+            removed += 1
+            continue
+        if len(poly) < 3 and (max(xs) - min(xs) + max(ys) - min(ys)) < max(w, h) * 0.03:
             removed += 1
             continue
         clean_polys.append(poly)
