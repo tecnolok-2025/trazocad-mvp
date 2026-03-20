@@ -350,6 +350,7 @@ def _build_result_payload(job_id: str, file_name: str, sheet_size: str, drawing_
         image_height=result['processed_height_px'],
         mm_per_px=result['estimated_scale_mm_per_px'],
         raster_path=cleaned_source,
+        step_px=float(result.get('geometry', {}).get('runtime_profile', {}).get('point_cloud_step_px', 10.0)),
     )
     report_path = build_report_pdf(
         output_path=output_dir / EXPECTED_OUTPUTS['report'],

@@ -218,7 +218,7 @@ function updateStatus(payload) {
       : state === 'recovering'
         ? 'El servidor está reconstruyendo el estado de la tarea. No cierres esta pestaña.'
         : state === 'missing'
-          ? 'La tarea se interrumpió en el servidor. En v70 el OCR es opcional para reducir este problema; TrazoCad va a intentar reanudarla automáticamente si todavía existe una copia recuperable del archivo.'
+          ? 'La tarea se interrumpió en el servidor. En v72 el OCR trabaja por regiones y con presupuesto adaptativo. Si aun así la tarea se interrumpe, TrazoCad intentará reanudarla automáticamente si existe una copia recuperable del archivo.'
           : 'Procesando el archivo en segundo plano.';
   stageLabel.textContent = `Etapa: ${stage.replaceAll('_', ' ')}`;
   jobLabel.textContent = `Job: ${payload?.job_id || '—'}`;
@@ -379,7 +379,7 @@ form.addEventListener('submit', async (event) => {
   pollingStartedAt = Date.now();
   autoRetryCount = 0;
   statusMessage.textContent = 'Enviando el archivo al servidor…';
-  statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano. El OCR queda apagado por defecto salvo que se solicite explícitamente.';
+  statusDetail.textContent = 'La tarea se va a ejecutar en segundo plano. En v72 el sistema adapta OCR y densidad de cálculo según memoria disponible.';
   stageLabel.textContent = 'Etapa: cola';
   jobLabel.textContent = 'Job: preparando';
   timeLabel.textContent = 'Tiempo: 0 s';

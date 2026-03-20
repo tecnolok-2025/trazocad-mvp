@@ -9,6 +9,23 @@ from ezdxf.enums import TextEntityAlignment
 from PIL import Image
 
 
+def _documental_regions_from_geometry(geometry: dict[str, Any], image_width: int, image_height: int) -> list[dict[str, float]]:
+    regions = [dict(box) for box in geometry.get('title_blocks', [])]
+    if not regions:
+        regions.append({'x': image_width * 0.72, 'y': image_height * 0.68, 'w': image_width * 0.24, 'h': image_height * 0.24})
+    regions.append({'x': image_width * 0.34, 'y': image_height * 0.88, 'w': image_width * 0.34, 'h': image_height * 0.08})
+    return regions
+
+
+def _line_intersects_region(line: dict[str, Any], region: dict[str, float]) -> bool:
+    x1, y1, x2, y2 = float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0))
+    minx, maxx = min(x1, x2), max(x1, x2)
+    miny, maxy = min(y1, y2), max(y1, y2)
+    rx1, ry1 = float(region['x']), float(region['y'])
+    rx2, ry2 = rx1 + float(region['w']), ry1 + float(region['h'])
+    return not (maxx < rx1 or minx > rx2 or maxy < ry1 or miny > ry2)
+
+
 def _add_text_item(msp, item: dict[str, Any], layer: str, height_mm: float, mm_per_px: float) -> None:
     text = str(item.get('text', '')).strip()
     if not text:
@@ -39,7 +56,12 @@ def export_to_dxf(
 
     height_mm = image_height * mm_per_px
 
+    documental = _documental_regions_from_geometry(geometry, image_width, image_height)
     for line in geometry.get('lines', []):
+        if any(_line_intersects_region(line, region) for region in documental):
+            length = math.hypot(float(line.get('x2', 0)) - float(line.get('x1', 0)), float(line.get('y2', 0)) - float(line.get('y1', 0)))
+            if length < max(image_width, image_height) * 0.20:
+                continue
         msp.add_line(
             (line['x1'] * mm_per_px, height_mm - line['y1'] * mm_per_px),
             (line['x2'] * mm_per_px, height_mm - line['y2'] * mm_per_px),
@@ -92,23 +114,42 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
     return count
 
 
-def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, height_mm: float, mm_per_px: float) -> int:
+def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, height_mm: float, mm_per_px: float, geometry: dict[str, Any] | None = None, step_px: float = 10.0) -> int:
     count = 0
+    geometry = geometry or {}
+    documental = _documental_regions_from_geometry(geometry, image_width, image_height)
     with Image.open(raster_path) as image:
         gray = image.convert('L')
         width, height = gray.size
         if width <= 0 or height <= 0:
             return 0
-        step = max(int(round(max(width, height) / 450)), 2)
-        black_threshold = 200
+        base_step = max(int(round(step_px)), 2)
+        black_threshold = 215
         px = gray.load()
         scale_x = image_width / float(width)
         scale_y = image_height / float(height)
-        for y in range(0, height, step):
-            for x in range(0, width, step):
+        for y in range(0, height, base_step):
+            for x in range(0, width, base_step):
+                mapped_x = x * scale_x
+                mapped_y = y * scale_y
+                local_step = base_step
+                for region in documental:
+                    if region['x'] <= mapped_x <= region['x'] + region['w'] and region['y'] <= mapped_y <= region['y'] + region['h']:
+                        local_step = max(2, base_step // 2)
+                        break
                 if px[x, y] < black_threshold:
-                    _add_point(msp, x * scale_x, y * scale_y, height_mm, mm_per_px)
+                    _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
                     count += 1
+                    # refuerzo suave de densidad en zonas documentales y curvas
+                    if local_step < base_step:
+                        xn = min(width - 1, x + local_step)
+                        yn = min(height - 1, y + local_step)
+                        if px[xn, y] < black_threshold:
+                            _add_point(msp, xn * scale_x, y * scale_y, height_mm, mm_per_px)
+                            count += 1
+                        if px[x, yn] < black_threshold:
+                            _add_point(msp, x * scale_x, yn * scale_y, height_mm, mm_per_px)
+                            count += 1
     return count
 
 
@@ -132,7 +173,7 @@ def export_to_point_cloud_dxf(
     height_mm = image_height * mm_per_px
     point_count = 0
     if raster_path and raster_path.exists():
-        point_count = _sample_raster(msp, raster_path, image_width, image_height, height_mm, mm_per_px)
+        point_count = _sample_raster(msp, raster_path, image_width, image_height, height_mm, mm_per_px, geometry=geometry, step_px=step_px)
     if point_count == 0:
         _sample_geometry(msp, geometry, height_mm, mm_per_px, step_px)
 

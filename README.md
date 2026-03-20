@@ -1,14 +1,13 @@
-# TrazoCad v71
+# TrazoCad v72
 
-Versión enfocada en **preservación documental**: la presentación visual parte del plano original normalizado, con tratamiento separado para rótulo, notas y título del plano.
+Versión enfocada en **orquestación adaptativa**, OCR por regiones y saneamiento del DXF.
 
-TrazoCad es una aplicación de Tecno Logisti-K SA para digitalizar croquis, fotos o planos escaneados y generar DXF, PDF, JPG y PNG.
-
-## Enfoque de esta versión
-- OCR dirigido por regiones para cotas, textos y rótulos
-- reconstrucción raster más inteligente para cerrar pequeños cortes y reforzar trazos débiles
-- PDF más aprovechado en hoja
-- DXF con capas separadas de geometría, cotas, textos y rótulo cuando el OCR reconoce contenido
+## Qué mejora esta versión
+- prioriza terminar sin caerse: ajusta OCR y nube de puntos según presión de memoria
+- OCR regional por bloques documentales, no sobre todo el plano
+- saneamiento de líneas espurias en DXF, especialmente cerca de rótulo y zonas documentales
+- nube de puntos más densa en rótulo, notas y título, y más liviana en zonas vacías
+- salida visual preservada desde el original normalizado
 
 ## Flujo principal
 1. subir imagen
@@ -17,21 +16,10 @@ TrazoCad es una aplicación de Tecno Logisti-K SA para digitalizar croquis, foto
 4. procesar
 5. abrir o descargar DXF/PDF/JPG/PNG
 
-## Notas guiadas
-La interfaz incluye una temática y una acción sugerida que se convierten en notas internas del proceso. También puede agregarse una instrucción libre.
+## Criterio operativo
+- el OCR sigue siendo opcional y regional
+- el sistema baja exigencia si detecta presión de memoria
+- la salida visual y el DXF base tienen prioridad sobre OCR de baja confianza
 
-## OCR
-La versión incorpora RapidOCR por regiones. Si el motor OCR no está disponible, la app sigue funcionando y conserva los textos/rótulos en las salidas raster y en el DXF de nube de puntos.
-
-
-## Notas de la v71
-
-- El OCR queda desactivado por defecto para priorizar estabilidad en Render.
-- Solo se activa si el usuario elige una acción OCR desde la interfaz.
-- La imagen de presentación fue suavizada para evitar líneas negras demasiado agresivas y preservar mejor el rótulo.
-
-
-## Corrección de la v71
-- Cache busting de estáticos para evitar que el navegador muestre una versión vieja.
-- Cabeceras no-store en HTML y respuestas JSON de versión/infra/health.
-- Alineación completa de numeración visible en README y UI.
+## Recomendación
+Para medir estabilidad primero probá sin OCR extra. Después activá OCR regional solo cuando necesites texto de rótulo o notas.

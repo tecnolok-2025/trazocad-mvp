@@ -7,6 +7,7 @@ from collections import defaultdict
 import math
 import os
 import time
+import resource
 
 import cv2
 import numpy as np
@@ -158,14 +159,114 @@ def _blend_min(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return cv2.min(a, b)
 
 
-def _ocr_budgets(directives: dict[str, bool] | None = None) -> dict[str, float | int]:
+def _memory_usage_mb() -> float:
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux ru_maxrss is in KiB.
+        return float(rss_kb) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _adaptive_runtime_profile(image_shape: tuple[int, int, int], directives: dict[str, bool] | None = None) -> dict[str, Any]:
     directives = directives or {}
+    h, w = image_shape[:2]
+    megapixels = (h * w) / 1_000_000.0
+    memory_mb = _memory_usage_mb()
+    safety_reserve_mb = float(os.getenv('TRAZOCAD_MEMORY_SAFETY_RESERVE_MB', '60'))
+    soft_limit_mb = float(os.getenv('TRAZOCAD_MEMORY_SOFT_LIMIT_MB', '410'))
+    hard_limit_mb = float(os.getenv('TRAZOCAD_MEMORY_HARD_LIMIT_MB', '470'))
+    pressure = 'normal'
+    if memory_mb >= hard_limit_mb - safety_reserve_mb:
+        pressure = 'critical'
+    elif memory_mb >= soft_limit_mb - safety_reserve_mb:
+        pressure = 'high'
+    elif megapixels > 3.5:
+        pressure = 'medium'
+    # Instancias chicas: jamás forzar OCR global.
+    ocr_allowed = directives.get('force_ocr', False) and pressure != 'critical'
+    if directives.get('safe_mode') and pressure in {'high', 'critical'}:
+        ocr_allowed = False
+    point_cloud_step = 8.0 if pressure == 'normal' else 10.0 if pressure == 'medium' else 12.0 if pressure == 'high' else 14.0
+    return {
+        'memory_mb': round(memory_mb, 1),
+        'memory_pressure': pressure,
+        'ocr_allowed': ocr_allowed,
+        'ocr_regions_multiplier': 1.0 if pressure == 'normal' else 0.8 if pressure == 'medium' else 0.55 if pressure == 'high' else 0.35,
+        'ocr_pixel_fraction_multiplier': 1.0 if pressure == 'normal' else 0.8 if pressure == 'medium' else 0.55 if pressure == 'high' else 0.4,
+        'point_cloud_step_px': point_cloud_step,
+        'safety_reserve_mb': safety_reserve_mb,
+    }
+
+
+def _region_intersection_ratio(line_box: tuple[int,int,int,int], region: dict[str,int]) -> float:
+    lx1, ly1, lx2, ly2 = line_box
+    rx1, ry1 = int(region.get('x', 0)), int(region.get('y', 0))
+    rx2, ry2 = rx1 + int(region.get('w', 0)), ry1 + int(region.get('h', 0))
+    ix1, iy1 = max(lx1, rx1), max(ly1, ry1)
+    ix2, iy2 = min(lx2, rx2), min(ly2, ry2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = (ix2 - ix1) * (iy2 - iy1)
+    area = max((lx2 - lx1) * (ly2 - ly1), 1)
+    return inter / float(area)
+
+
+def _sanitize_geometry(geometry: dict[str, Any], documental_regions: list[dict[str, int]], image_shape: tuple[int, int, int], directives: dict[str, bool] | None = None) -> dict[str, Any]:
+    directives = directives or {}
+    h, w = image_shape[:2]
+    clean_lines: list[dict[str, int]] = []
+    removed = 0
+    for line in geometry.get('lines', []):
+        x1, y1 = int(line['x1']), int(line['y1'])
+        x2, y2 = int(line['x2']), int(line['y2'])
+        length = math.hypot(x2 - x1, y2 - y1)
+        box = (min(x1, x2), min(y1, y2), max(x1, x2) + 1, max(y1, y2) + 1)
+        overlap = max((_region_intersection_ratio(box, region) for region in documental_regions), default=0.0)
+        if overlap > 0.55 and length < max(w, h) * 0.18:
+            removed += 1
+            continue
+        if length < 7:
+            removed += 1
+            continue
+        clean_lines.append(line)
+    clean_polys: list[list[dict[str, int]]] = []
+    for poly in geometry.get('polylines', []):
+        if len(poly) < 2:
+            continue
+        xs = [int(pt['x']) for pt in poly]
+        ys = [int(pt['y']) for pt in poly]
+        box = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
+        overlap = max((_region_intersection_ratio(box, region) for region in documental_regions), default=0.0)
+        if overlap > 0.75 and (max(xs) - min(xs)) * (max(ys) - min(ys)) < (w * h) * 0.03:
+            removed += 1
+            continue
+        clean_polys.append(poly)
+    geometry['lines'] = clean_lines
+    geometry['polylines'] = clean_polys
+    geometry['removed_documental_vectors'] = removed
+    return geometry
+
+
+def _ocr_budgets(directives: dict[str, bool] | None = None, runtime_profile: dict[str, Any] | None = None) -> dict[str, float | int]:
+    directives = directives or {}
+    runtime_profile = runtime_profile or {}
     wants_documental = directives.get('preserve_title_block') or directives.get('prioritize_dimensions')
     wants_heavy = wants_documental and directives.get('prioritize_fidelity')
+    mult = float(runtime_profile.get('ocr_regions_multiplier', 1.0))
+    pix_mult = float(runtime_profile.get('ocr_pixel_fraction_multiplier', 1.0))
+    base_boxes = 28 if wants_heavy else 18 if wants_documental else 10
+    base_fraction = 0.24 if wants_heavy else 0.16 if wants_documental else 0.10
+    pressure = str(runtime_profile.get('memory_pressure', 'normal'))
+    base_time = 20 if wants_heavy else 12 if wants_documental else 7
+    if pressure == 'high':
+        base_time = min(base_time, 9)
+    elif pressure == 'critical':
+        base_time = min(base_time, 5)
     return {
-        'max_boxes': 28 if wants_heavy else 18 if wants_documental else 10,
-        'pixel_fraction': 0.24 if wants_heavy else 0.16 if wants_documental else 0.10,
-        'time_budget_s': float(os.getenv('TRAZOCAD_OCR_TIME_BUDGET_S', '20' if wants_heavy else '12' if wants_documental else '7')),
+        'max_boxes': max(4, int(round(base_boxes * mult))),
+        'pixel_fraction': max(0.05, base_fraction * pix_mult),
+        'time_budget_s': float(os.getenv('TRAZOCAD_OCR_TIME_BUDGET_S', str(base_time))),
         'max_roi_long_side': 520 if wants_heavy else 420 if wants_documental else 320,
     }
 
@@ -792,8 +893,11 @@ def _collect_priority_ocr_regions(text_boxes: list[dict[str, int]], graphics_bin
     return deduped
 
 
-def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, directives: dict[str, bool] | None = None) -> tuple[list[dict[str, Any]], str, str | None]:
+def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_binary: np.ndarray, directives: dict[str, bool] | None = None, runtime_profile: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], str, str | None]:
     directives = directives or {}
+    runtime_profile = runtime_profile or {}
+    if not runtime_profile.get('ocr_allowed', directives.get('force_ocr', False)):
+        return [], "desactivado por presupuesto", "El OCR se omitió en esta corrida para preservar estabilidad y memoria del servicio."
     candidate_regions = _collect_priority_ocr_regions(text_boxes, graphics_binary, image_bgr.shape, directives)
     if not candidate_regions:
         return [], "sin zonas de texto", None
@@ -828,7 +932,7 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
     warnings: list[str] = []
     texts: list[dict[str, Any]] = []
     boxes = list(candidate_regions)
-    budgets = _ocr_budgets(directives)
+    budgets = _ocr_budgets(directives, runtime_profile)
     max_boxes = int(budgets['max_boxes'])
     if len(boxes) > max_boxes:
         warnings.append(f"OCR reducido: se analizaron {max_boxes} regiones prioritarias de {len(boxes)} detectadas para evitar sobrecarga del servidor.")
@@ -849,6 +953,9 @@ def _run_ocr(image_bgr: np.ndarray, text_boxes: list[dict[str, int]], graphics_b
         if roi.size == 0:
             continue
         roi_pixels = int(roi.shape[0] * roi.shape[1])
+        if runtime_profile.get('memory_pressure') == 'critical':
+            warnings.append('OCR detenido por presión crítica de memoria.')
+            break
         if time.monotonic() - started_at > float(budgets['time_budget_s']):
             warnings.append('OCR reducido por presupuesto de tiempo para estabilizar el proceso.')
             break
@@ -925,7 +1032,7 @@ def _classify_text_items(ocr_items: list[dict[str, Any]], image_shape: tuple[int
         if es_cota:
             box["tipo_texto"] = "cota"
             cotas.append(box)
-        elif region_baja and (ancho_rel > 0.10 or len(text) >= 6):
+        elif region_baja and (ancho_rel > 0.08 or len(text) >= 4):
             box["tipo_texto"] = "rotulo"
             rotulos.append(box)
         else:
@@ -1457,6 +1564,7 @@ def process_drawing(
         image, transform_matrix = _warp_document(image, corners)
 
     image = _apply_memory_budget(image)
+    runtime_profile = _adaptive_runtime_profile(image.shape, directives)
 
     if progress_callback:
         progress_callback("reconstruyendo_base")
@@ -1474,13 +1582,16 @@ def process_drawing(
     if progress_callback:
         progress_callback("reconociendo_texto")
     if _should_run_ocr(directives):
-        ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives)
+        runtime_profile = _adaptive_runtime_profile(enhanced_bgr.shape, directives)
+        ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives, runtime_profile)
     else:
         ocr_items, ocr_engine, ocr_warning = [], "desactivado por estabilidad", "El OCR quedó desactivado en esta corrida para priorizar estabilidad en Render. Activá una acción OCR solo cuando realmente necesites recuperar textos."
     cota_texts, rotulo_texts, general_texts = _classify_text_items(ocr_items, image.shape)
     if progress_callback:
         progress_callback("vectorizando_geometria")
     geometry = _detect_geometry(graphics_binary, text_boxes)
+    documental_regions = _documental_regions(image.shape, geometry.get("title_blocks", []))
+    geometry = _sanitize_geometry(geometry, documental_regions, image.shape, directives)
     geometry["texts"] = cota_texts + rotulo_texts + general_texts
     geometry["cota_texts"] = cota_texts
     geometry["rotulo_texts"] = rotulo_texts
@@ -1489,11 +1600,14 @@ def process_drawing(
     geometry["dimension_arrows"] = _detect_dimension_arrows(graphics_binary, geometry["dimension_lines"])
     geometry["review_texts"] = _estimate_text_review_items(ocr_items)
     geometry["title_blocks"] = _detect_title_block_refined(graphics_binary, rotulo_texts)
+    documental_regions = _documental_regions(image.shape, geometry.get("title_blocks", []))
+    geometry = _sanitize_geometry(geometry, documental_regions, image.shape, directives)
     _symbols = _detect_symbols(graphics_binary, geometry["lines"], text_boxes)
     geometry.update(_symbols)
     geometry["discipline_guess"] = _guess_discipline(ocr_items, geometry)
     geometry["symbol_blocks"] = _build_symbol_blocks(_symbols, geometry["discipline_guess"])
     geometry["discipline_rules"] = _build_discipline_rules(geometry["discipline_guess"], cota_texts, rotulo_texts, _symbols)
+    geometry["runtime_profile"] = runtime_profile
 
     quality_metrics = _compute_quality_metrics(binary, graphics_binary, geometry, (original_h, original_w, 3), image.shape, sheet_size.upper(), sheet_orientation.upper(), len(ocr_items))
     quality_metrics["cota_texts"] = len(cota_texts)
@@ -1598,6 +1712,7 @@ def process_drawing(
         f"Símbolos preliminares detectados: {len(geometry.get('electrical_symbols', [])) + len(geometry.get('sanitary_symbols', [])) + len(geometry.get('mechanical_symbols', []))}.",
         f"Bloques CAD sugeridos: {len(geometry.get('symbol_blocks', []))}. Tipos preliminares detectados: {len({item.get('nombre', '') for item in geometry.get('symbol_blocks', []) if item.get('nombre')})}.",
         f"Reglas de disciplina aplicadas: {len(geometry.get('discipline_rules', []))}.",
+        f"Perfil adaptativo: memoria {runtime_profile.get('memory_mb', 0)} MB, presión {runtime_profile.get('memory_pressure', 'normal')}, OCR {'habilitado' if runtime_profile.get('ocr_allowed') else 'limitado'}.",
         f"Observaciones del usuario: {notes.strip() or 'sin notas adicionales'}.",
         f"Directivas activas: {', '.join([k for k, v in directives.items() if v]) or 'ninguna'}.",
         "La salida sigue siendo una reconstrucción asistida y debe validarse antes de utilizarse como documentación definitiva.",
