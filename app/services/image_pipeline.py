@@ -12,6 +12,9 @@ import resource
 import cv2
 import numpy as np
 
+from app.services.document_normalizer import normalize_document
+from app.services.region_segmenter import segment_document_regions
+
 SHEET_SIZES_MM = {
     "A4": (210, 297),
     "A3": (297, 420),
@@ -1333,9 +1336,10 @@ def _build_vector_base(graphics_binary: np.ndarray, ocr_items: list[dict[str, An
         cv2.rectangle(clean, (item["x"], item["y"]), (item["x"] + item["w"], item["y"] + item["h"]), (170, 170, 220), 1)
     return clean
 
-def _build_presentation_image(source_bgr: np.ndarray, enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None) -> np.ndarray:
+def _build_presentation_image(source_bgr: np.ndarray, enhanced_bgr: np.ndarray, normalized_gray: np.ndarray, binary: np.ndarray, repaired_binary: np.ndarray, title_blocks: list[dict[str, int]] | None = None, directives: dict[str, bool] | None = None, documental_regions: list[dict[str, int]] | None = None) -> np.ndarray:
     directives = directives or {}
     title_blocks = title_blocks or []
+    documental_regions = documental_regions or _documental_regions(source_bgr.shape[:2], title_blocks)
     source_gray = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
     original_gray = cv2.normalize(normalized_gray, None, 0, 255, cv2.NORM_MINMAX)
     base_gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
@@ -1351,7 +1355,7 @@ def _build_presentation_image(source_bgr: np.ndarray, enhanced_bgr: np.ndarray, 
     presentation_gray = np.clip(presentation_gray.astype(np.float32) - line_mask_f * darken, 0, 255).astype(np.uint8)
 
     # Zonas documentales: restauración y micro-realce del original para mantener textos/rótulo nítidos.
-    for box in _documental_regions(presentation_gray.shape, title_blocks):
+    for box in documental_regions:
         x1 = max(0, int(box['x']))
         y1 = max(0, int(box['y']))
         x2 = min(presentation_gray.shape[1], x1 + int(box['w']))
@@ -1577,14 +1581,21 @@ def process_drawing(
     if progress_callback:
         progress_callback("reconstruyendo_base")
     image, auto_upscaled, upscale_factor = _auto_upscale(image)
+    doc_norm = normalize_document(image)
     reconstructed_gray, normalized_gray, enhanced_bgr = _enhance_image(image)
+    # 78.1: base documental preservada + binario reparado para separar mejor documento y geometría.
+    normalized_gray = cv2.max(normalized_gray, doc_norm["normalized_gray"])
+    enhanced_bgr = cv2.addWeighted(enhanced_bgr, 0.45, doc_norm["preserved_bgr"], 0.55, 0)
     binary = _build_binary(reconstructed_gray)
     repaired_binary = _repair_broken_traces(binary, directives)
     repaired_binary = _reinforce_title_block(repaired_binary, directives)
     if progress_callback:
         progress_callback("separando_texto_y_dibujo")
+    segmented = segment_document_regions(normalized_gray, repaired_binary)
     text_boxes, text_mask = _detect_text_regions(repaired_binary)
+    text_mask = cv2.bitwise_or(text_mask, segmented.get("text_seed_mask", np.zeros_like(text_mask)))
     graphics_binary = cv2.bitwise_and(repaired_binary, cv2.bitwise_not(text_mask))
+    graphics_binary = cv2.bitwise_and(graphics_binary, segmented.get("geometry_mask", graphics_binary))
     graphics_binary = cv2.morphologyEx(graphics_binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
 
     if progress_callback:
@@ -1598,7 +1609,8 @@ def process_drawing(
     if progress_callback:
         progress_callback("vectorizando_geometria")
     geometry = _detect_geometry(graphics_binary, text_boxes)
-    documental_regions = _documental_regions(image.shape, geometry.get("title_blocks", []))
+    geometry["segmented_document_regions"] = segmented.get("documental_regions", [])
+    documental_regions = segmented.get("documental_regions", _documental_regions(image.shape, geometry.get("title_blocks", [])))
     geometry = _sanitize_geometry(geometry, documental_regions, image.shape, directives)
     geometry["texts"] = cota_texts + rotulo_texts + general_texts
     geometry["cota_texts"] = cota_texts
@@ -1607,8 +1619,9 @@ def process_drawing(
     geometry["dimension_lines"] = _associate_dimension_lines(geometry["lines"], cota_texts)
     geometry["dimension_arrows"] = _detect_dimension_arrows(graphics_binary, geometry["dimension_lines"])
     geometry["review_texts"] = _estimate_text_review_items(ocr_items)
-    geometry["title_blocks"] = _detect_title_block_refined(graphics_binary, rotulo_texts)
-    documental_regions = _documental_regions(image.shape, geometry.get("title_blocks", []))
+    segmented_title = segmented.get("title_block")
+    geometry["title_blocks"] = [segmented_title] if segmented_title else _detect_title_block_refined(graphics_binary, rotulo_texts)
+    documental_regions = segmented.get("documental_regions", _documental_regions(image.shape, geometry.get("title_blocks", [])))
     geometry = _sanitize_geometry(geometry, documental_regions, image.shape, directives)
     _symbols = _detect_symbols(graphics_binary, geometry["lines"], text_boxes)
     geometry.update(_symbols)
@@ -1689,7 +1702,7 @@ def process_drawing(
 
     reconstruction_preview = enhanced_bgr
     vector_base = _build_vector_base(graphics_binary, ocr_items)
-    presentation_base = _build_presentation_image(image, enhanced_bgr, normalized_gray, binary, repaired_binary, geometry.get("title_blocks", []), directives)
+    presentation_base = _build_presentation_image(image, enhanced_bgr, normalized_gray, binary, repaired_binary, geometry.get("title_blocks", []), directives, documental_regions=documental_regions)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     reconstruction_path = output_dir / "reconstruccion_previa.png"
@@ -1697,6 +1710,9 @@ def process_drawing(
     presentation_path = output_dir / "presentacion.png"
     overlay_path = output_dir / "overlay.png"
     original_path = output_dir / "original_preview.png"
+    doc_regions_path = output_dir / "document_regions.png"
+    doc_mask_path = output_dir / "document_mask.png"
+    geometry_mask_path = output_dir / "geometry_mask.png"
     _save_image(reconstruction_path, _resize_for_report(reconstruction_preview))
     _save_image(cleaned_path, _resize_for_report(vector_base))
     _save_image(presentation_path, _resize_for_report(presentation_base))
@@ -1705,6 +1721,9 @@ def process_drawing(
     if os.getenv('TRAZOCAD_DISABLE_ANALYSIS_PREVIEW', '1').strip().lower() not in {'1', 'true', 'yes', 'si'}:
         analysis_preview = _build_analysis_preview(enhanced_bgr, text_boxes)
         _save_image(original_path, _resize_for_report(analysis_preview))
+    _save_image(doc_regions_path, _resize_for_report(segmented.get("debug_regions", cv2.cvtColor(normalized_gray, cv2.COLOR_GRAY2BGR))))
+    _save_image(doc_mask_path, _resize_for_report(cv2.cvtColor(segmented.get("documental_mask", np.zeros_like(normalized_gray)), cv2.COLOR_GRAY2BGR)))
+    _save_image(geometry_mask_path, _resize_for_report(cv2.cvtColor(segmented.get("geometry_mask", graphics_binary), cv2.COLOR_GRAY2BGR)))
 
     assumptions = [
         f"Tipo de plano interpretado: {drawing_type}.",
@@ -1715,6 +1734,7 @@ def process_drawing(
         f"Cotas OCR detectadas: {len(cota_texts)}.",
         f"Rótulos OCR detectados: {len(rotulo_texts)}.",
         f"Cuadros de plano detectados: {len(geometry.get('title_blocks', []))}.",
+        f"Regiones documentales segmentadas: {len(documental_regions)}.",
         f"Segmentos vectoriales depurados: {geometry.get('line_segments_after_cleanup_count', len(geometry['lines']))}.",
         f"Disciplina sugerida por el ojo inteligente: {geometry.get('discipline_guess', 'general')}.",
         f"Símbolos preliminares detectados: {len(geometry.get('electrical_symbols', [])) + len(geometry.get('sanitary_symbols', [])) + len(geometry.get('mechanical_symbols', []))}.",
@@ -1783,6 +1803,9 @@ def process_drawing(
             "presentation_image": str(presentation_path),
             "overlay_image": str(overlay_path),
             "original_preview": str(original_path),
+            "document_regions": str(doc_regions_path),
+            "document_mask": str(doc_mask_path),
+            "geometry_mask": str(geometry_mask_path),
         },
         sheet_orientation=sheet_orientation.upper(),
         preserved_aspect_ratio=True,

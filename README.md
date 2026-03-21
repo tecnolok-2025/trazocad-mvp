@@ -1,6 +1,7 @@
-# TrazoCad v77
+# TrazoCad v78.1
 
-Versión enfocada en **orquestación adaptativa**, OCR por regiones y saneamiento del DXF.
+Base documental y segmentación. Esta revisión separa mejor documento, rótulo, texto y geometría para preparar el rediseño del motor DXF.
+
 
 ## Qué mejora esta versión
 - prioriza terminar sin caerse: ajusta OCR y nube de puntos según presión de memoria
