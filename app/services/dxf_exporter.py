@@ -163,16 +163,27 @@ def _detect_document_boxes(support_map: np.ndarray | None, image_width: int, ima
 def _extract_supported_hv_lines(support_map: np.ndarray | None, image_width: int, image_height: int) -> list[dict[str, float]]:
     if support_map is None:
         return []
-    lines_p = cv2.HoughLinesP(support_map, 1, np.pi / 180, threshold=80, minLineLength=max(40, int(max(image_width, image_height) * 0.08)), maxLineGap=8)
+    strong = cv2.morphologyEx(support_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    lines_p = cv2.HoughLinesP(
+        strong,
+        1,
+        np.pi / 180,
+        threshold=55,
+        minLineLength=max(28, int(max(image_width, image_height) * 0.045)),
+        maxLineGap=14,
+    )
     if lines_p is None:
         return []
     extra: list[dict[str, float]] = []
     for item in lines_p[:, 0, :]:
         x1, y1, x2, y2 = [float(v) for v in item]
         dx, dy = abs(x2 - x1), abs(y2 - y1)
-        if min(dx, dy) > max(4.0, max(dx, dy) * 0.08):
+        length = math.hypot(dx, dy)
+        if length < max(18.0, max(image_width, image_height) * 0.018):
             continue
-        extra.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
+        ratio = min(dx, dy) / max(max(dx, dy), 1.0)
+        if ratio <= 0.14 or 0.32 <= ratio <= 0.82:
+            extra.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2})
     return extra
 
 
@@ -230,18 +241,18 @@ def _merge_axis_aligned_lines(lines: list[dict[str, float]], coord_snap: int = 8
 def _extract_supported_contours(support_map: np.ndarray | None, image_width: int, image_height: int) -> list[list[dict[str, float]]]:
     if support_map is None:
         return []
-    work = cv2.morphologyEx(support_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
-    contours, _ = cv2.findContours(work, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    work = cv2.morphologyEx(support_map, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
+    contours, _ = cv2.findContours(work, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     polys: list[list[dict[str, float]]] = []
     img_area = float(image_width * image_height)
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
         area = cv2.contourArea(cnt)
-        if peri < max(80.0, image_width * 0.04):
+        if peri < max(36.0, image_width * 0.012):
             continue
-        if area < max(20.0, img_area * 0.00003):
+        if area < max(8.0, img_area * 0.000004):
             continue
-        approx = cv2.approxPolyDP(cnt, max(1.5, 0.0035 * peri), True)
+        approx = cv2.approxPolyDP(cnt, max(0.8, 0.0018 * peri), True)
         if len(approx) < 2:
             continue
         poly = [{'x': float(pt[0][0]), 'y': float(pt[0][1])} for pt in approx]
@@ -269,19 +280,19 @@ def _sanitize_lines_for_dxf(lines: list[dict[str, Any]], documental: list[dict[s
         near_text = _near_text(line, text_items)
         support = _line_support_ratio(line, support_map)
 
-        if support < 0.28 and length < img_long * 0.22:
+        if support < 0.18 and length < img_long * 0.18:
             continue
-        if support < 0.16:
+        if support < 0.10 and length < img_long * 0.06:
             continue
-        if overlap > 0.55 and length < img_long * 0.35 and support < 0.72:
+        if overlap > 0.70 and length < img_long * 0.22 and support < 0.58:
             continue
-        if overlap > 0.18 and near_text and length < img_long * 0.18 and support < 0.68:
+        if overlap > 0.28 and near_text and length < img_long * 0.12 and support < 0.48:
             continue
-        if connected == 0 and length < img_long * 0.1 and not axis_like:
+        if connected == 0 and length < img_long * 0.05 and not axis_like and support < 0.40:
             continue
-        if connected <= 1 and length < img_long * 0.06 and support < 0.7:
+        if connected <= 1 and length < img_long * 0.035 and support < 0.52:
             continue
-        if near_text and length < img_long * 0.05 and not axis_like:
+        if near_text and length < img_long * 0.028 and not axis_like and support < 0.45:
             continue
 
         key = _normalized_line_key(line)
@@ -386,7 +397,8 @@ def export_to_dxf(
         documental.extend(inferred_doc_boxes)
     text_items = geometry.get('texts', []) or []
     source_lines = list(geometry.get('lines', []))
-    source_lines.extend(_merge_axis_aligned_lines(_extract_supported_hv_lines(support_map, image_width, image_height)))
+    raster_lines = _extract_supported_hv_lines(support_map, image_width, image_height)
+    source_lines.extend(_merge_axis_aligned_lines(raster_lines, coord_snap=6, gap_tol=14.0))
     lines = _sanitize_lines_for_dxf(source_lines, documental, text_items, image_width, image_height, support_map=support_map)
     contour_polys = _extract_supported_contours(support_map, image_width, image_height)
     dimension_lines = geometry.get('dimension_lines', []) or []
@@ -453,7 +465,7 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
 
     def sample_line(x1: float, y1: float, x2: float, y2: float, local_step: float | None = None):
         nonlocal count
-        step = max(local_step or step_px, 1.4)
+        step = max(local_step or step_px, 1.2)
         dist = math.hypot(x2 - x1, y2 - y1)
         steps = max(int(dist / step), 1)
         for i in range(steps + 1):
@@ -464,17 +476,15 @@ def _sample_geometry(msp, geometry: dict[str, Any], height_mm: float, mm_per_px:
     for line in geometry.get('lines', []):
         sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)))
     for line in geometry.get('dimension_lines', []):
-        sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)), local_step=max(1.4, step_px * 0.4))
-    exported_poly_keys: set[tuple[int, int, int, int]] = set()
-    for poly in geometry.get('polylines', []) + contour_polys:
+        sample_line(float(line.get('x1', 0)), float(line.get('y1', 0)), float(line.get('x2', 0)), float(line.get('y2', 0)), local_step=max(1.0, step_px * 0.35))
+    for poly in geometry.get('polylines', []):
         if len(poly) < 2:
             continue
-        local_step = max(1.4, step_px * 0.4) if _poly_is_curve_like(poly) else step_px
+        local_step = max(1.0, step_px * 0.35) if _poly_is_curve_like(poly) else max(1.2, step_px * 0.75)
         for p1, p2 in zip(poly[:-1], poly[1:]):
             sample_line(float(p1.get('x', 0)), float(p1.get('y', 0)), float(p2.get('x', 0)), float(p2.get('y', 0)), local_step=local_step)
 
     return count
-
 
 def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, height_mm: float, mm_per_px: float, geometry: dict[str, Any] | None = None, step_px: float = 4.0) -> int:
     count = 0
@@ -487,9 +497,9 @@ def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, 
     if inferred_doc_boxes:
         documental.extend(inferred_doc_boxes)
     height, width = support_map.shape[:2]
-    base_step = max(int(round(step_px)), 1)
     scale_x = image_width / float(width)
     scale_y = image_height / float(height)
+    base_step = max(int(round(step_px)), 1)
     for y in range(0, height, base_step):
         for x in range(0, width, base_step):
             mapped_x = x * scale_x
@@ -499,23 +509,22 @@ def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, 
             for region in documental:
                 if region['x'] <= mapped_x <= region['x'] + region['w'] and region['y'] <= mapped_y <= region['y'] + region['h']:
                     documental_hit = True
-                    local_step = max(1, base_step // 2)
+                    local_step = 1
                     break
-            thresh_hit = support_map[y, x] > 0
-            if thresh_hit:
-                _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
-                count += 1
-                neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step), (-local_step, 0), (0, -local_step)]
-                if documental_hit:
-                    neigh += [(2 * local_step, 0), (0, 2 * local_step), (2 * local_step, local_step)]
-                for dx, dy in neigh:
-                    xn = max(0, min(width - 1, x + dx))
-                    yn = max(0, min(height - 1, y + dy))
-                    if support_map[yn, xn] > 0:
-                        _add_point(msp, xn * scale_x, yn * scale_y, height_mm, mm_per_px)
-                        count += 1
+            if support_map[y, x] <= 0:
+                continue
+            _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
+            count += 1
+            neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step), (-local_step, 0), (0, -local_step)]
+            if documental_hit:
+                neigh += [(-local_step, -local_step), (2 * local_step, 0), (0, 2 * local_step), (2 * local_step, local_step), (local_step, 2 * local_step)]
+            for dx, dy in neigh:
+                xn = max(0, min(width - 1, x + dx))
+                yn = max(0, min(height - 1, y + dy))
+                if support_map[yn, xn] > 0:
+                    _add_point(msp, xn * scale_x, yn * scale_y, height_mm, mm_per_px)
+                    count += 1
     return count
-
 
 def export_to_point_cloud_dxf(
     output_path: Path,
@@ -524,7 +533,7 @@ def export_to_point_cloud_dxf(
     image_height: int,
     mm_per_px: float,
     raster_path: Path | None = None,
-    step_px: float = 4.0,
+    step_px: float = 2.5,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = ezdxf.new(dxfversion='R2010')
