@@ -26,7 +26,7 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 OUTPUT_DIR = DATA_DIR / 'outputs'
 STATIC_DIR = BASE_DIR / 'app' / 'static'
 VERSION_FILE = BASE_DIR / 'VERSION'
-APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '78.1.0'
+APP_VERSION = VERSION_FILE.read_text(encoding='utf-8').strip() if VERSION_FILE.exists() else '78.2.0'
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -50,7 +50,7 @@ EXPECTED_OUTPUTS = {
 app = FastAPI(
     title='TrazoCad',
     version=APP_VERSION,
-    description='TrazoCad 78.1 base documental y segmentación: separación entre documento, rótulo, texto y geometría como base del rediseño del motor DXF.',
+    description='TrazoCad 78.2 base documental y segmentación: separación entre documento, rótulo, texto y geometría como base del rediseño del motor DXF.',
 )
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
@@ -90,7 +90,7 @@ def _runtime_version_payload() -> dict[str, str]:
         'producto': 'TrazoCad',
         'empresa': 'Tecno Logisti-K SA (TLK)',
         'version': APP_VERSION,
-        'linea': 'base documental y segmentación 78.1',
+        'linea': 'base documental y segmentación 78.2',
         'rama': os.getenv('RENDER_GIT_BRANCH', 'local'),
         'commit': os.getenv('RENDER_GIT_COMMIT', 'sin-dato'),
         'repositorio': os.getenv('RENDER_GIT_REPO_SLUG', 'sin-dato'),

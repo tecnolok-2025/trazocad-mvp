@@ -1,6 +1,6 @@
 # Changelog
 
-## 78.1.0
+## 78.2.0
 - nueva base documental y segmentación de regiones
 - preservación explícita de rótulo, notas y título
 - máscaras de documento y geometría exportadas como artefactos intermedios

@@ -5,91 +5,156 @@ import cv2
 import numpy as np
 
 
+def _clamp_box(box: dict[str, int], w: int, h: int) -> dict[str, int]:
+    x = max(0, min(w - 1, int(box.get("x", 0))))
+    y = max(0, min(h - 1, int(box.get("y", 0))))
+    bw = max(1, int(box.get("w", 0)))
+    bh = max(1, int(box.get("h", 0)))
+    x2 = max(x + 1, min(w, x + bw))
+    y2 = max(y + 1, min(h, y + bh))
+    return {"x": x, "y": y, "w": x2 - x, "h": y2 - y}
+
+
 def _rect_mask(shape: tuple[int, int], regions: list[dict[str, int]]) -> np.ndarray:
     h, w = shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     for box in regions:
-        x = max(0, int(box.get("x", 0)))
-        y = max(0, int(box.get("y", 0)))
-        bw = max(0, int(box.get("w", 0)))
-        bh = max(0, int(box.get("h", 0)))
-        x2 = min(w, x + bw)
-        y2 = min(h, y + bh)
-        if x2 > x and y2 > y:
-            cv2.rectangle(mask, (x, y), (x2, y2), 255, -1)
+        box = _clamp_box(box, w, h)
+        x, y, bw, bh = box['x'], box['y'], box['w'], box['h']
+        cv2.rectangle(mask, (x, y), (x + bw, y + bh), 255, -1)
     return mask
+
+
+def _largest_box_from_roi(inv_roi: np.ndarray, x0: int, y0: int, min_area: int, close_kernel: tuple[int, int]) -> dict[str, int] | None:
+    merged = cv2.morphologyEx(inv_roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, close_kernel), iterations=2)
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_area = 0
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < min_area:
+            continue
+        if area > best_area:
+            best_area = area
+            best = {"x": x0 + x, "y": y0 + y, "w": bw, "h": bh}
+    return best
 
 
 def _find_title_block_candidate(binary: np.ndarray) -> dict[str, int] | None:
     h, w = binary.shape[:2]
-    x0, y0 = int(w * 0.52), int(h * 0.62)
+    # Buscar estrictamente en el cuadrante inferior derecho, no invadir la geometría principal.
+    x0, y0 = int(w * 0.73), int(h * 0.74)
     roi = binary[y0:h, x0:w]
     if roi.size == 0:
         return None
-    inv = 255 - roi
-    closed = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 7)), iterations=2)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best = None
-    best_score = -1.0
+    inv = roi.copy()  # binary ya viene invertido: trazos blancos sobre fondo negro.
+    candidate = _largest_box_from_roi(inv, x0, y0, min_area=max(3000, int(w * h * 0.006)), close_kernel=(17, 9))
+    if candidate is None:
+        return None
+    pad_x = max(6, int(candidate['w'] * 0.03))
+    pad_y = max(6, int(candidate['h'] * 0.05))
+    candidate = {
+        'x': candidate['x'] - pad_x,
+        'y': candidate['y'] - pad_y,
+        'w': candidate['w'] + pad_x * 2,
+        'h': candidate['h'] + pad_y * 2,
+    }
+    return _clamp_box(candidate, w, h)
+
+
+def _find_notes_region(binary: np.ndarray, title_block: dict[str, int]) -> dict[str, int] | None:
+    h, w = binary.shape[:2]
+    x0 = max(0, int(title_block['x'] - title_block['w'] * 0.05))
+    x1 = min(w, int(title_block['x'] + title_block['w'] * 0.98))
+    y1 = max(0, int(title_block['y'] - h * 0.17))
+    y2 = max(0, int(title_block['y'] - h * 0.015))
+    if y2 <= y1 or x1 <= x0:
+        return None
+    roi = binary[y1:y2, x0:x1]
+    if roi.size == 0:
+        return None
+    merged = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (19, 5)), iterations=1)
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
         area = bw * bh
-        if area < (w * h) * 0.01:
+        if area < max(300, int(w * h * 0.00018)):
             continue
-        if bw < w * 0.16 or bh < h * 0.05:
+        if bw < int(title_block['w'] * 0.16) or bh < 8:
+            continue
+        boxes.append((x, y, bw, bh))
+    if not boxes:
+        fallback = {
+            'x': x0,
+            'y': y1,
+            'w': max(10, x1 - x0),
+            'h': max(10, y2 - y1),
+        }
+        return _clamp_box(fallback, w, h)
+    minx = min(x for x, _, _, _ in boxes)
+    miny = min(y for _, y, _, _ in boxes)
+    maxx = max(x + bw for x, _, bw, _ in boxes)
+    maxy = max(y + bh for _, y, _, bh in boxes)
+    return _clamp_box({'x': x0 + minx - 6, 'y': y1 + miny - 4, 'w': (maxx - minx) + 12, 'h': (maxy - miny) + 8}, w, h)
+
+
+def _find_title_band(binary: np.ndarray) -> dict[str, int] | None:
+    h, w = binary.shape[:2]
+    x0, x1 = int(w * 0.28), int(w * 0.72)
+    y0, y1 = int(h * 0.86), int(h * 0.96)
+    roi = binary[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    merged = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3)), iterations=1)
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_score = -1
+    for cnt in contours:
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        area = bw * bh
+        if area < max(120, int(w * h * 0.00008)):
             continue
         aspect = bw / float(max(bh, 1))
-        if aspect < 1.2 or aspect > 8.5:
+        if aspect < 2.2:
             continue
-        # premiar posición abajo-derecha y tamaño razonable
-        cx = x0 + x + bw / 2.0
-        cy = y0 + y + bh / 2.0
-        pos_score = (cx / max(w, 1)) * 0.55 + (cy / max(h, 1)) * 0.45
-        score = area * pos_score
+        score = area
         if score > best_score:
             best_score = score
-            best = {"x": x0 + x, "y": y0 + y, "w": bw, "h": bh}
-    if best is not None:
-        pad_x = max(8, int(best['w'] * 0.04))
-        pad_y = max(8, int(best['h'] * 0.08))
-        best = {
-            'x': max(0, best['x'] - pad_x),
-            'y': max(0, best['y'] - pad_y),
-            'w': min(w - max(0, best['x'] - pad_x), best['w'] + pad_x * 2),
-            'h': min(h - max(0, best['y'] - pad_y), best['h'] + pad_y * 2),
-        }
-    return best
+            best = {'x': x0 + x - 6, 'y': y0 + y - 4, 'w': bw + 12, 'h': bh + 8}
+    if best is None:
+        best = {'x': int(w * 0.36), 'y': int(h * 0.89), 'w': int(w * 0.20), 'h': int(h * 0.045)}
+    return _clamp_box(best, w, h)
 
 
 def segment_document_regions(normalized_gray: np.ndarray, binary: np.ndarray) -> dict[str, Any]:
     h, w = normalized_gray.shape[:2]
     title_block = _find_title_block_candidate(binary)
     if not title_block:
-        title_block = {'x': int(w * 0.68), 'y': int(h * 0.72), 'w': int(w * 0.28), 'h': int(h * 0.20)}
+        title_block = _clamp_box({'x': int(w * 0.79), 'y': int(h * 0.77), 'w': int(w * 0.17), 'h': int(h * 0.18)}, w, h)
 
-    notes_box = {
-        'x': max(0, int(title_block['x'] - w * 0.04)),
-        'y': max(0, int(title_block['y'] - h * 0.16)),
-        'w': min(w - max(0, int(title_block['x'] - w * 0.04)), int(title_block['w'] + w * 0.08)),
-        'h': min(h - max(0, int(title_block['y'] - h * 0.16)), int(max(title_block['h'] * 0.70, h * 0.12))),
-    }
-    title_band = {
-        'x': int(w * 0.25),
-        'y': int(h * 0.88),
-        'w': int(w * 0.50),
-        'h': int(h * 0.08),
-    }
+    notes_box = _find_notes_region(binary, title_block)
+    if not notes_box:
+        notes_box = _clamp_box({
+            'x': int(title_block['x'] - title_block['w'] * 0.02),
+            'y': int(title_block['y'] - h * 0.11),
+            'w': int(title_block['w'] * 1.02),
+            'h': int(h * 0.10),
+        }, w, h)
+
+    title_band = _find_title_band(binary)
+
     documental_regions = [title_block, notes_box, title_band]
+    # Dilatación mucho más conservadora para no invadir media lámina.
     documental_mask = _rect_mask((h, w), documental_regions)
-    documental_mask = cv2.dilate(documental_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)), iterations=1)
+    documental_mask = cv2.dilate(documental_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=1)
 
-    # Geometría base = binario reparado menos documento
     geometry_mask = cv2.bitwise_and(binary, cv2.bitwise_not(documental_mask))
 
-    # Texto regional aproximado dentro de zonas documentales.
-    inv_doc = cv2.bitwise_and(255 - binary, documental_mask)
+    inv_doc = cv2.bitwise_and(binary, documental_mask)
     text_seed = cv2.morphologyEx(inv_doc, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
-    text_seed = cv2.dilate(text_seed, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
+    text_seed = cv2.dilate(text_seed, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
 
     debug = cv2.cvtColor(normalized_gray, cv2.COLOR_GRAY2BGR)
     colors = [(180, 30, 170), (30, 140, 220), (40, 170, 70)]
