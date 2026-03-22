@@ -8,12 +8,14 @@ import math
 import os
 import time
 import resource
+import json
 
 import cv2
 import numpy as np
 
 from app.services.document_normalizer import normalize_document
 from app.services.region_segmenter import segment_document_regions
+from app.services.text_extractor import extract_text_by_regions
 
 SHEET_SIZES_MM = {
     "A4": (210, 297),
@@ -1035,15 +1037,16 @@ def _classify_text_items(ocr_items: list[dict[str, Any]], image_shape: tuple[int
     for item in ocr_items:
         text = str(item.get("text", "")).strip()
         box = dict(item)
+        region_type = str(item.get('region_type', '')).lower()
         compacto = text.replace(" ", "")
         tiene_digitos = any(ch.isdigit() for ch in compacto)
         es_cota = tiene_digitos and len(compacto) <= 12
         region_baja = item.get("y", 0) > h * 0.72
         ancho_rel = item.get("w", 0) / float(max(w, 1))
-        if es_cota:
+        if es_cota and region_type not in {'rotulo', 'titulo'}:
             box["tipo_texto"] = "cota"
             cotas.append(box)
-        elif region_baja and (ancho_rel > 0.08 or len(text) >= 4):
+        elif region_type in {'rotulo', 'notas', 'titulo'} or (region_baja and (ancho_rel > 0.08 or len(text) >= 4)):
             box["tipo_texto"] = "rotulo"
             rotulos.append(box)
         else:
@@ -1602,8 +1605,32 @@ def process_drawing(
         progress_callback("reconociendo_texto")
     if _should_run_ocr(directives):
         runtime_profile = _adaptive_runtime_profile(enhanced_bgr.shape, directives)
-        ocr_items, ocr_engine, ocr_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives, runtime_profile)
+        regional_items, regional_engine, regional_warning, regional_regions = extract_text_by_regions(enhanced_bgr, segmented, directives, runtime_profile, extra_boxes=text_boxes[:4])
+        box_items, box_engine, box_warning = _run_ocr(enhanced_bgr, text_boxes, graphics_binary, directives, runtime_profile)
+        ocr_items = sorted(regional_items + box_items, key=lambda d: (-float(d.get('score', 0)), d.get('y', 0), d.get('x', 0)))
+        # dedupe por solapamiento
+        deduped_items = []
+        for item in ocr_items:
+            duplicate = False
+            for keep in deduped_items:
+                ix1 = max(item['x'], keep['x'])
+                iy1 = max(item['y'], keep['y'])
+                ix2 = min(item['x'] + item['w'], keep['x'] + keep['w'])
+                iy2 = min(item['y'] + item['h'], keep['y'] + keep['h'])
+                if ix2 <= ix1 or iy2 <= iy1:
+                    continue
+                inter = (ix2 - ix1) * (iy2 - iy1)
+                area = max(item['w'] * item['h'], 1)
+                if inter / area > 0.45:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped_items.append(item)
+        ocr_items = deduped_items
+        ocr_engine = regional_engine if regional_items else box_engine
+        ocr_warning = '; '.join([w for w in [regional_warning, box_warning] if w]) or None
     else:
+        regional_regions = []
         ocr_items, ocr_engine, ocr_warning = [], "desactivado por estabilidad", "El OCR quedó desactivado en esta corrida para priorizar estabilidad en Render. Activá una acción OCR solo cuando realmente necesites recuperar textos."
     cota_texts, rotulo_texts, general_texts = _classify_text_items(ocr_items, image.shape)
     if progress_callback:
@@ -1713,6 +1740,8 @@ def process_drawing(
     doc_regions_path = output_dir / "document_regions.png"
     doc_mask_path = output_dir / "document_mask.png"
     geometry_mask_path = output_dir / "geometry_mask.png"
+    ocr_regions_path = output_dir / "ocr_regions.png"
+    text_blocks_path = output_dir / "text_blocks.json"
     _save_image(reconstruction_path, _resize_for_report(reconstruction_preview))
     _save_image(cleaned_path, _resize_for_report(vector_base))
     _save_image(presentation_path, _resize_for_report(presentation_base))
@@ -1724,6 +1753,14 @@ def process_drawing(
     _save_image(doc_regions_path, _resize_for_report(segmented.get("debug_regions", cv2.cvtColor(normalized_gray, cv2.COLOR_GRAY2BGR))))
     _save_image(doc_mask_path, _resize_for_report(cv2.cvtColor(segmented.get("documental_mask", np.zeros_like(normalized_gray)), cv2.COLOR_GRAY2BGR)))
     _save_image(geometry_mask_path, _resize_for_report(cv2.cvtColor(segmented.get("geometry_mask", graphics_binary), cv2.COLOR_GRAY2BGR)))
+    ocr_debug = enhanced_bgr.copy()
+    for reg in regional_regions if 'regional_regions' in locals() else []:
+        color = (130, 30, 170) if reg.get('region_type') == 'rotulo' else (30, 140, 220) if reg.get('region_type') == 'notas' else (40, 170, 70)
+        x, y, bw, bh = reg['x'], reg['y'], reg['w'], reg['h']
+        cv2.rectangle(ocr_debug, (x, y), (x + bw, y + bh), color, 2)
+        cv2.putText(ocr_debug, reg.get('region_type', 'ocr')[:12], (x + 4, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    _save_image(ocr_regions_path, _resize_for_report(ocr_debug))
+    text_blocks_path.write_text(json.dumps(ocr_items, ensure_ascii=False, indent=2), encoding='utf-8')
 
     assumptions = [
         f"Tipo de plano interpretado: {drawing_type}.",
@@ -1806,6 +1843,8 @@ def process_drawing(
             "document_regions": str(doc_regions_path),
             "document_mask": str(doc_mask_path),
             "geometry_mask": str(geometry_mask_path),
+            "ocr_regions": str(ocr_regions_path),
+            "text_blocks": str(text_blocks_path),
         },
         sheet_orientation=sheet_orientation.upper(),
         preserved_aspect_ratio=True,
