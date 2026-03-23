@@ -381,60 +381,85 @@ def export_to_dxf(
     raster_path: Path | None = None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = ezdxf.new(dxfversion='R2010')
+    doc = ezdxf.new(dxfversion="R2010")
     doc.units = ezdxf.units.MM
     msp = doc.modelspace()
 
-    for layer, color in [('GEOMETRIA', 7), ('CURVAS', 4), ('COTAS', 3), ('TEXTOS', 2), ('ROTULO', 5)]:
+    for layer, color in [("GEOMETRIA", 7), ("CURVAS", 4), ("COTAS", 3), ("TEXTOS", 2), ("ROTULO", 5)]:
         if layer not in doc.layers:
             doc.layers.add(layer, color=color)
 
     height_mm = image_height * mm_per_px
     support_map = _load_support_map(raster_path)
     documental = _documental_regions_from_geometry(geometry, image_width, image_height)
-    inferred_doc_boxes = _detect_document_boxes(support_map, image_width, image_height)
-    if inferred_doc_boxes:
-        documental.extend(inferred_doc_boxes)
     text_items = geometry.get('texts', []) or []
-    source_lines = list(geometry.get('lines', []))
-    raster_lines = _extract_supported_hv_lines(support_map, image_width, image_height)
-    source_lines.extend(_merge_axis_aligned_lines(raster_lines, coord_snap=6, gap_tol=14.0))
-    lines = _sanitize_lines_for_dxf(source_lines, documental, text_items, image_width, image_height, support_map=support_map)
-    contour_polys = _extract_supported_contours(support_map, image_width, image_height)
     dimension_lines = geometry.get('dimension_lines', []) or []
     cota_texts = geometry.get('cota_texts', []) or []
 
+    # v78.4 strategy: clean geometry only. Do NOT inject raster Hough support lines, contour polylines,
+    # or title-block fallbacks into the vectorized DXF. Those were a major source of overlays / false lines.
+    base_lines = list(geometry.get('lines', []))
+    lines = _sanitize_lines_for_dxf(base_lines, documental, text_items, image_width, image_height, support_map=support_map)
+
+    # stronger de-duplication and conservative export
+    exported = []
+    seen = set()
     for line in lines:
+        key = _normalized_line_key(line, snap=10)
+        if key in seen:
+            continue
+        seen.add(key)
+        length = _line_length(line)
+        support = _line_support_ratio(line, support_map)
+        overlap = max((_line_overlap_ratio(line, r) for r in documental), default=0.0)
+        # keep only well-supported geometry; documentary areas stay out of vector DXF for now
+        if overlap > 0.12 and support < 0.72:
+            continue
+        if length < max(18.0, max(image_width, image_height) * 0.025) and support < 0.55:
+            continue
+        exported.append(line)
+
+    for line in exported:
         layer = _classify_line_layer(line, dimension_lines, cota_texts, documental)
+        if layer == 'ROTULO':
+            # v78.4: keep vector DXF free of documentary overlays
+            continue
         msp.add_line(
             (line['x1'] * mm_per_px, height_mm - line['y1'] * mm_per_px),
             (line['x2'] * mm_per_px, height_mm - line['y2'] * mm_per_px),
             dxfattribs={'layer': layer},
         )
 
+    # only export original geometry polylines, not contour-derived polylines
     exported_poly_keys: set[tuple[int, int, int, int]] = set()
-    for poly in geometry.get('polylines', []) + contour_polys:
+    for poly in geometry.get('polylines', []):
         if len(poly) < 2:
             continue
         minx, miny, maxx, maxy = _poly_bbox(poly)
-        region_hit = any(not (maxx < r['x'] or minx > r['x'] + r['w'] or maxy < r['y'] or miny > r['y'] + r['h']) for r in documental)
         width = maxx - minx
         height = maxy - miny
-        if region_hit and width < image_width * 0.12 and height < image_height * 0.12:
+        region_hit = any(not (maxx < r['x'] or minx > r['x'] + r['w'] or maxy < r['y'] or miny > r['y'] + r['h']) for r in documental)
+        if region_hit:
             continue
-        bbox_key = tuple(int(round(v / 6) * 6) for v in (minx, miny, maxx, maxy))
+        if max(width, height) < max(image_width, image_height) * 0.03:
+            continue
+        bbox_key = tuple(int(round(v / 8) * 8) for v in (minx, miny, maxx, maxy))
         if bbox_key in exported_poly_keys:
             continue
         exported_poly_keys.add(bbox_key)
         pts = [(pt['x'] * mm_per_px, height_mm - pt['y'] * mm_per_px) for pt in poly]
         closed = len(poly) >= 3 and (poly[0]['x'], poly[0]['y']) == (poly[-1]['x'], poly[-1]['y'])
-        layer = 'CURVAS' if _poly_is_curve_like(poly) else ('ROTULO' if region_hit else 'GEOMETRIA')
+        layer = 'CURVAS' if _poly_is_curve_like(poly) else 'GEOMETRIA'
         msp.add_lwpolyline(pts, dxfattribs={'layer': layer, 'closed': closed})
 
+    # Dimension lines remain, but only if strongly supported
     for line in dimension_lines:
         if _line_length(line) < 10:
             continue
-        if _line_support_ratio(line, support_map) < 0.22:
+        if _line_support_ratio(line, support_map) < 0.34:
+            continue
+        overlap = max((_line_overlap_ratio(line, r) for r in documental), default=0.0)
+        if overlap > 0.15:
             continue
         msp.add_line(
             (line['x1'] * mm_per_px, height_mm - line['y1'] * mm_per_px),
@@ -442,19 +467,14 @@ def export_to_dxf(
             dxfattribs={'layer': 'COTAS'},
         )
 
+    # keep text export available for non-documental detected texts only
     for item in geometry.get('cota_texts', []):
         _add_text_item(msp, item, 'COTAS', height_mm, mm_per_px)
     for item in geometry.get('general_texts', []):
         _add_text_item(msp, item, 'TEXTOS', height_mm, mm_per_px)
-    for item in geometry.get('rotulo_texts', []):
-        _add_text_item(msp, item, 'ROTULO', height_mm, mm_per_px)
-
-    title_boxes = geometry.get('title_blocks', []) or inferred_doc_boxes
-    _add_title_block_fallback(msp, title_boxes, height_mm, mm_per_px)
 
     doc.saveas(output_path)
     return output_path
-
 
 def _add_point(msp, x_px: float, y_px: float, height_mm: float, mm_per_px: float) -> None:
     msp.add_point((x_px * mm_per_px, height_mm - y_px * mm_per_px), dxfattribs={'layer': 'PUNTOS'})
@@ -515,7 +535,7 @@ def _sample_raster(msp, raster_path: Path, image_width: int, image_height: int, 
                 continue
             _add_point(msp, mapped_x, mapped_y, height_mm, mm_per_px)
             count += 1
-            neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step), (-local_step, 0), (0, -local_step)]
+            neigh = [(local_step, 0), (0, local_step), (local_step, local_step), (-local_step, local_step)]
             if documental_hit:
                 neigh += [(-local_step, -local_step), (2 * local_step, 0), (0, 2 * local_step), (2 * local_step, local_step), (local_step, 2 * local_step)]
             for dx, dy in neigh:
@@ -533,7 +553,7 @@ def export_to_point_cloud_dxf(
     image_height: int,
     mm_per_px: float,
     raster_path: Path | None = None,
-    step_px: float = 2.5,
+    step_px: float = 1.6,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = ezdxf.new(dxfversion='R2010')

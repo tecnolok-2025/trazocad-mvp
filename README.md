@@ -1,4 +1,4 @@
-# TrazoCad v78.3
+# TrazoCad v78.4
 
 Base documental y segmentación. Esta revisión separa mejor documento, rótulo, texto y geometría para preparar el rediseño del motor DXF.
 
